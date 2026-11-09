@@ -258,7 +258,7 @@ export async function createCentralRuntime(env = process.env, dependencies = {})
         mutations: broker.mutations.size, logins: broker.loginPending.size, approvals: broker.approvals.size, serialized: store.active.size,
         claude: Number(Boolean(claude.owner || claude.metadataOwner)), unresolved,
         preparations: bridgeLeases.size, restoring: Number(Boolean(restoring)), unavailable: Number(broker.unavailable) };
-      return { idle: draining && Object.values(counts).every(value => value === 0), counts };
+      return { idle: Object.values(counts).every(value => value === 0), counts };
     }
     return { allocator, broker, admittedProviders, bridgeUpgrade, close, restore, ready: () => ready && !stopped && !draining,
       drain: () => { draining = true; broker.draining = true; }, updateActivity, briqMcpRequest: (req, res) => briqTransport.handle(req, res),

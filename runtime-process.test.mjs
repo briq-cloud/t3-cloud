@@ -28,3 +28,27 @@ test('owned process uses selected Node, dependencies and child image, then ackno
   await driver.drain(); assert.deepEqual(await driver.activity(), { idle: true });
   await driver.stop(); assert.equal(driver.alive, false);
 });
+
+test('owned IPC rejects unrecognized methods, paths and malformed identities before calling updater', async t => {
+  const directory = await mkdtemp(join(tmpdir(), 't3-owned-update-ipc-')); t.after(() => rm(directory, { recursive: true, force: true }));
+  const file = join(directory, 'manager.mjs');
+  await writeFile(file, `let sent = false, responses = [];
+    process.on('message', value => {
+      if (value.channel === 'runtime-updates') { responses.push(value); return; }
+      process.send({ protocol: 1, id: value.id, ok: true, result: value.method === 'activity' ? responses : {} });
+      if (value.method === 'health' && !sent) {
+        sent = true;
+        const base = { protocol: 1, channel: 'runtime-updates', id: 1, method: 'status' };
+        for (const patch of [{ method: 'stop' }, { id: -1 }, { path: '/private/credential' }, { method: 'automatic', enabled: 'yes' }, { enabled: true }]) process.send({ ...base, ...patch });
+        process.send({ ...base, id: 2 });
+      }
+    }); process.on('disconnect', () => process.exit(0));`);
+  const methods = [];
+  let done; const called = new Promise(resolve => { done = resolve; });
+  const driver = runtimeProcess({ T3_CWD: directory }, { spawnProcess: (_command, _args, options) => spawn(process.execPath, [file], options) });
+  driver.setUpdates(async method => { methods.push(method); done(); return { phase: 'running' }; });
+  t.after(() => driver.stop()); await driver.start('/'); await called; await driver.health();
+  const responses = await driver.activity();
+  assert.deepEqual(methods, ['status']);
+  assert.deepEqual(responses.map(value => ({ id: value.id, result: value.result })), [{ id: 2, result: { phase: 'running' } }]);
+});

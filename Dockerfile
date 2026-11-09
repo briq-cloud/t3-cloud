@@ -121,6 +121,9 @@ RUN test "$(cat /etc/t3-cloud/codex-version)" = "$(node -p 'require("/opt/t3/sou
   && test -x /opt/t3/t3 \
   && printf 'T3 Code source\t2359643cffa6ba9ee84d6f2694b935de54a8013e\tpinned source, lock and local patch\n' >> /etc/t3-cloud/downloads
 
+ARG SOURCE_COMMIT
+RUN printf '%s' "$SOURCE_COMMIT" | grep -Eq '^[a-f0-9]{40}$' \
+  && printf '%s\n' "$SOURCE_COMMIT" > /etc/t3-cloud/source
 COPY . /opt/t3-cloud
 # Use the same pinned Node for the manager, child and scoped transport shim.
 # The runtime imports native TypeScript modules and requires bash for child execution.

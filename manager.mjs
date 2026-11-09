@@ -4,6 +4,7 @@ import { randomBytes } from 'node:crypto';
 import { createOwnerAuth, equalKey } from './cloud-auth.mjs';
 import { cloudProxy } from './cloud-proxy.mjs';
 import { managerPage } from './manager-ui.mjs';
+import { runtimeUpdatesPage } from './runtime-updates-page.mjs';
 import { CLAUDE_CLOUD_ENABLED } from './claude-runtime.mjs';
 
 const privateHeaders = {
@@ -24,15 +25,18 @@ async function body(req) {
 }
 const only = (value, keys) => Object.keys(value).every(key => keys.includes(key));
 const id = value => typeof value === 'string' && /^[a-zA-Z0-9_-]{1,128}$/.test(value);
+export function runtimeManagementPath(path) {
+  return ['/_cloud', '/_cloud/', '/_cloud/login', '/_cloud/logout', '/_cloud/updates', '/_cloud/updates/status', '/_cloud/updates/check', '/_cloud/updates/update', '/_cloud/updates/automatic'].includes(path);
+}
 const denySocket = socket => { socket.end('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n'); };
 
 /** Central connection management only. Native T3 retains its own authentication and paths. */
 export function createCloudManager({ role, publicOrigin, ownerKey, ownerId, allocator, broker,
-  connections, nativeOrigin, invalidateNativeConnections, allocatorToken, admittedProviders = ['codex'], t3Target = 'http://127.0.0.1:3773', terminalTarget = 'http://127.0.0.1:7681', bridgeUpgrade, briqMcpRequest, ready = () => true }) {
+  connections, nativeOrigin, invalidateNativeConnections, allocatorToken, admittedProviders = ['codex'], t3Target = 'http://127.0.0.1:3773', terminalTarget = 'http://127.0.0.1:7681', bridgeUpgrade, briqMcpRequest, ready = () => true, nativeAdmitting = () => true, runtimeUpdates, managementOnly = false }) {
   if (!['central', 'standalone'].includes(role)) throw Error('Manager requires central or standalone role');
-  if (role === 'central' && (!id(ownerId) || typeof allocator?.allocate !== 'function' || typeof broker?.ownerRequest !== 'function'))
+  if (role === 'central' && (!id(ownerId) || !managementOnly && (typeof allocator?.allocate !== 'function' || typeof broker?.ownerRequest !== 'function')))
     throw Error('Central sandbox runtime is required');
-  if (!connections) throw Error('Native connection adapters are required');
+  if (!managementOnly && !connections) throw Error('Native connection adapters are required');
   const auth = createOwnerAuth({ key: ownerKey, origin: publicOrigin });
   const native = cloudProxy({ target: t3Target, publicOrigin: auth.origin, ownerBearer: req => auth.ownerBearer(req) });
   const terminal = cloudProxy({ target: terminalTarget, publicOrigin: auth.origin, ownerBearer: req => auth.ownerBearer(req), terminal: true });
@@ -40,14 +44,18 @@ export function createCloudManager({ role, publicOrigin, ownerKey, ownerId, allo
   let allocating = 0;
   const updateRequests = new Set();
   const server = createServer(async (req, res) => {
-    updateRequests.add(res); res.once('close', () => updateRequests.delete(res));
+    let management = false;
+    try { management = runtimeUpdates && runtimeManagementPath(new URL(req.url, auth.origin).pathname); } catch {}
+    if (!management) { updateRequests.add(res); res.once('close', () => updateRequests.delete(res)); }
     try {
       const url = new URL(req.url, auth.origin);
+      const management = runtimeUpdates && runtimeManagementPath(url.pathname);
+      if ((managementOnly || !nativeAdmitting()) && !management) return json(res, 503, { error: 'Native admission is closed' });
       if (url.pathname === '/_cloud/briq/mcp') {
         if (role !== 'central' || !briqMcpRequest) return json(res, 404, { error: 'Unavailable' });
         return await briqMcpRequest(req, res);
       }
-      if (!ready()) return json(res, 503, { error: 'Central runtime is restoring' });
+      if (!ready() && !management) return json(res, 503, { error: 'Central runtime is restoring' });
       if (!url.pathname.startsWith('/_cloud/') && url.pathname !== '/_cloud') return native.http(req, res);
       // Only a non-secret capability is public; native source uses this to refuse a local fallback.
       if (url.pathname === '/_cloud/capabilities' && req.method === 'GET') return json(res, 200, { role });
@@ -141,14 +149,25 @@ export function createCloudManager({ role, publicOrigin, ownerKey, ownerId, allo
         return cookie ? json(res, 200, { authenticated: true }, { 'set-cookie': cookie }) : json(res, 401, { error: 'Owner key not accepted' });
       }
       const authorized = localAllocator || auth.authorized(req);
-      if (['/_cloud', '/_cloud/'].includes(url.pathname) && req.method === 'GET') {
+      if ((['/_cloud', '/_cloud/'].includes(url.pathname) || url.pathname === '/_cloud/updates' && runtimeUpdates) && req.method === 'GET') {
         const nonce = randomBytes(18).toString('base64');
         res.writeHead(200, { ...privateHeaders, 'content-type': 'text/html; charset=utf-8',
           'content-security-policy': `default-src 'none'; script-src 'nonce-${nonce}'; style-src 'nonce-${nonce}'; connect-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'` });
-        return res.end(managerPage({ nonce, authorized, role }));
+        return res.end(url.pathname === '/_cloud/updates' || managementOnly ? runtimeUpdatesPage({ nonce, authorized, role }) : managerPage({ nonce, authorized, role }));
       }
       if (!authorized) return json(res, 401, { error: 'Open /_cloud/ and sign in with your owner key' });
       if (url.pathname === '/_cloud/logout' && req.method === 'POST') return json(res, 200, { authenticated: false }, { 'set-cookie': auth.logout(req) });
+      if (runtimeUpdates && url.pathname === '/_cloud/updates/status' && req.method === 'GET') return json(res, 200, await runtimeUpdates.status());
+      if (runtimeUpdates && ['/_cloud/updates/check', '/_cloud/updates/update', '/_cloud/updates/automatic'].includes(url.pathname) && req.method === 'POST') {
+        const input = await body(req);
+        if (url.pathname.endsWith('/automatic')) {
+          if (!only(input, ['enabled']) || typeof input.enabled !== 'boolean') return json(res, 400, { error: 'Invalid update preference' });
+          return json(res, 200, await runtimeUpdates.automatic(input.enabled));
+        }
+        if (!only(input, [])) return json(res, 400, { error: 'Invalid runtime update operation' });
+        return json(res, 200, await (url.pathname.endsWith('/check') ? runtimeUpdates.check() : runtimeUpdates.update()));
+      }
+      if (managementOnly) return json(res, 503, { error: 'Runtime recovery required' });
       if (url.pathname.startsWith('/_cloud/terminal/') && req.method === 'GET') return terminal.http(req, res);
       if (url.pathname === '/_cloud/connections' && req.method === 'GET') {
         let codex = { unavailable: true };
@@ -249,7 +268,7 @@ export function createCloudManager({ role, publicOrigin, ownerKey, ownerId, allo
   server.requestTimeout = 30000; server.headersTimeout = 10000;
   server.on('upgrade', (req, socket, head) => {
     let path; try { path = new URL(req.url, auth.origin).pathname; } catch { return denySocket(socket); }
-    if (!ready()) return denySocket(socket);
+    if (managementOnly || !nativeAdmitting() || !ready()) return denySocket(socket);
     if (path === '/_cloud/bridge' && role === 'central' && bridgeUpgrade) return bridgeUpgrade(req, socket, head);
     if (path.startsWith('/_cloud/')) {
       if (path.startsWith('/_cloud/terminal/') && auth.authorized(req) && auth.mutation(req)) { server.updateTerminalUsed = true; return terminal.upgrade(req, socket, head); }

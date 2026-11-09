@@ -7,10 +7,11 @@ import { createCloudManager } from './manager.mjs';
 import { nativeConnections } from './native-connections.mjs';
 import { publicOrigin, createOwnerAuth } from './cloud-auth.mjs';
 import { withoutExecutingMcpEnvironment } from './briq-native.mjs';
+import { runtimeUpdateClient } from './runtime-process.mjs';
 import { runtimePath, runtimePathEnv } from './runtime-paths.mjs';
 
 // Management and native admission have separate listeners; native processes stay loopback.
-export async function startManager(env = process.env, { centralRuntime, spawnProcess = spawn } = {}) {
+export async function startManager(env = process.env, { centralRuntime, spawnProcess = spawn, updates } = {}) {
   const role = env.T3_CLOUD_ROLE ?? 'central';
   if (!['central', 'standalone'].includes(role)) throw Error('Manager role must be central or standalone');
   const origin = publicOrigin(env.T3_CLOUD_PUBLIC_ORIGIN);
@@ -22,6 +23,7 @@ export async function startManager(env = process.env, { centralRuntime, spawnPro
   if (!Number.isSafeInteger(port) || port < 1 || port > 65535 || [3773,7681,8081].includes(port)) throw Error('Invalid public port');
   const allocatorToken = randomBytes(32).toString('base64url');
   let runtime, connections, server, nativeServer;
+  const runtimeUpdates = updates ?? (env.T3_CLOUD_SUPERVISED === '1' && process.send ? runtimeUpdateClient() : undefined);
   const children = [];
   const sockets = new Set();
   let stopping = false, draining = false;
@@ -38,6 +40,7 @@ export async function startManager(env = process.env, { centralRuntime, spawnPro
       const timer = setTimeout(() => reject(Error('Owned native child termination unknown')), 10000);
       child.once('exit', () => { clearTimeout(timer); resolve(); }); child.kill('SIGTERM');
     })));
+    runtimeUpdates?.close?.();
     await runtime?.close?.();
     })();
   }
@@ -49,7 +52,7 @@ export async function startManager(env = process.env, { centralRuntime, spawnPro
     connections = nativeConnections(env, { claudeCredentialOwner: runtime?.claudeCredentialOwner, briqCredentialOwner: runtime?.briqCredentialOwner });
     server = createCloudManager({ role, publicOrigin: origin, ownerKey: env.T3_CLOUD_OWNER_KEY,
       ownerId: env.T3_CLOUD_OWNER_ID, nativeOrigin: phoneOrigin,
-      invalidateNativeConnections: () => { if (!nativeServer) throw Error('Native transport unavailable'); nativeServer.invalidateConnections(); }, allocatorToken, connections, ...runtime, ready: () => !draining && !stopping && (runtime?.ready?.() ?? true) });
+      invalidateNativeConnections: () => { if (!nativeServer) throw Error('Native transport unavailable'); nativeServer.invalidateConnections(); }, allocatorToken, connections, ...runtime, runtimeUpdates, nativeAdmitting: () => !draining && !stopping, ready: () => !draining && !stopping && (runtime?.ready?.() ?? true) });
     if (phoneOrigin) nativeServer = createNativeFrontdoor({ publicOrigin: phoneOrigin, primaryOrigin: origin, ready: () => !draining && !stopping && runtime.ready(), ownerBearer: req => ownerAuth.ownerBearer(req) });
     for (const listener of [server, nativeServer].filter(Boolean)) {
       listener.on('connection',socket=>{sockets.add(socket);socket.once('close',()=>sockets.delete(socket));});
@@ -84,7 +87,7 @@ export async function startManager(env = process.env, { centralRuntime, spawnPro
         draining = true; runtime.drain(); nativeServer?.invalidateConnections();
       },
       async activity() {
-        if (!draining || role !== 'central') return { idle: false };
+        if (role !== 'central' || !runtime?.updateActivity || stopping) return { idle: false };
         const status = await runtime.updateActivity();
         return { ...status, idle: status.idle && server.updateRequests.size === 0 && !server.updateTerminalUsed && connections.updateIdle?.() === true };
       },

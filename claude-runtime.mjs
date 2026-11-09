@@ -8,6 +8,7 @@ import { canonicalJson, digest, identifier, providerInstanceId, providerMetadata
 import { ClaudeRemoteExec } from './claude-exec.mjs';
 import { scopedBriqTools } from './scoped-briq.mjs';
 import { providerRequestId } from './scoped-mcp-transport.mjs';
+import { runtimePath, runtimePathEnv } from './runtime-paths.mjs';
 
 // Integrated/native recovery and subscription gates have not passed. No environment variable overrides this.
 export const CLAUDE_CLOUD_ENABLED = false;
@@ -31,15 +32,15 @@ export function claudeInitializationMetadata(init) {
 const modelName = value => typeof value === 'string' && /^claude-[a-zA-Z0-9._-]{1,100}$/.test(value);
 
 async function loadNativeSdk() {
-  const directory = '/opt/t3/node_modules/@anthropic-ai/claude-agent-sdk';
+  const directory = runtimePath(process.env, 'opt/t3/node_modules/@anthropic-ai/claude-agent-sdk');
   const manifest = JSON.parse(await readFile(join(directory, 'manifest.json'), 'utf8'));
   const pkg = JSON.parse(await readFile(join(directory, 'package.json'), 'utf8'));
   if (pkg.version !== '0.3.276' || manifest.version !== '2.1.276') throw Error('Pinned Claude SDK required');
-  const binary = '/usr/local/bin/claude';
+  const binary = runtimePath(process.env, 'usr/local/bin/claude');
   const platform = manifest.platforms[`${process.platform}-${process.arch}`];
   if (!platform || createHash('sha256').update(await readFile(binary)).digest('hex') !== platform.checksum) throw Error('Pinned Claude CLI required');
   // Do not trust non-managed disableAllHooks: existing administrative hooks can still run.
-  const managed = JSON.parse(await readFile('/etc/claude-code/managed-settings.json', 'utf8'));
+  const managed = JSON.parse(await readFile(runtimePath(process.env, 'etc/claude-code/managed-settings.json'), 'utf8'));
   const expected = { disableAllHooks: true, disableAgentView: true, disableRemoteControl: true,
     env: { DISABLE_AUTOUPDATER: '1', DISABLE_UPDATES: '1' } };
   if (canonicalJson(managed) !== canonicalJson(expected)) throw Error('Controlled Claude managed policy required');
@@ -91,7 +92,7 @@ export class ClaudeRuntime {
     return value;
   }
   nativeEnvironment(home) {
-    return { HOME: home, CLAUDE_CONFIG_DIR: this.nativeConfigDirectory ?? join(home, '.claude'), PATH: '/usr/local/bin:/usr/bin:/bin', LANG: 'C.UTF-8',
+    return { HOME: home, CLAUDE_CONFIG_DIR: this.nativeConfigDirectory ?? join(home, '.claude'), PATH: runtimePathEnv(process.env), LANG: 'C.UTF-8',
       DISABLE_AUTOUPDATER: '1', CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1', ENABLE_CLAUDEAI_MCP_SERVERS: 'false',
       CLAUDE_CODE_AUTO_CONNECT_IDE: '0', CLAUDE_CODE_IDE_SKIP_AUTO_INSTALL: '1' };
   }

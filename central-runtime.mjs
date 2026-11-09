@@ -6,6 +6,7 @@ import { WebSocketServer, WebSocket } from 'ws';
 import { AllocationStore, ThreadAllocator, identifier, threadIdentifier, providerInstanceId } from './allocations.mjs';
 import { BriqCloud } from './briq-cloud.mjs';
 import { startAppServer, CapabilityBroker } from './broker.mjs';
+import { runtimePath, runtimePathEnv } from './runtime-paths.mjs';
 import { ScopedBriq } from './scoped-briq.mjs';
 import { ScopedMcpTransport } from './scoped-mcp-transport.mjs';
 
@@ -85,7 +86,9 @@ export async function createCentralRuntime(env = process.env, dependencies = {})
     try { await handle.writeFile(JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString() })); } finally { await handle.close(); }
     const store = new AllocationStore(join(directory, 'allocations')); await store.initialize();
     for (const binding of [...await store.list(), ...await store.listSources()]) if (binding.state !== 'revoked') requireEdgeBinding(binding, edgeCredential);
-    app = await (dependencies.startAppServer ?? startAppServer)({ binary: env.T3_CLOUD_CODEX_BINARY ?? 'codex', home: join(directory, 'codex') });
+    app = await (dependencies.startAppServer ?? startAppServer)({ binary: env.T3_CLOUD_CODEX_BINARY ??
+      (env.T3_RELEASE_ROOT ? runtimePath(env, 'opt/codex/bin/codex') : 'codex'),
+      home: join(directory, 'codex'), ...(env.T3_RELEASE_ROOT ? { path: runtimePathEnv(env) } : {}) });
     const cloud = dependencies.cloud ?? new BriqCloud({ directory: join(directory, 'stacks'), env });
     const scopedBriq = new ScopedBriq({ store, cloud });
     briqTransport = (dependencies.createScopedMcpTransport ?? (options => new ScopedMcpTransport(options)))({ store, scopedBriq, endpoint: `http://127.0.0.1:${env.PORT ?? 8080}/_cloud/briq/mcp` });

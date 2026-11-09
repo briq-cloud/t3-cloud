@@ -6,6 +6,7 @@ import { createCloudManager } from './manager.mjs';
 import { nativeConnections } from './native-connections.mjs';
 import { publicOrigin, createOwnerAuth } from './cloud-auth.mjs';
 import { withoutExecutingMcpEnvironment } from './briq-native.mjs';
+import { runtimePath, runtimePathEnv } from './runtime-paths.mjs';
 
 // Management and native admission have separate listeners; native processes stay loopback.
 export async function startManager(env = process.env, { centralRuntime, spawnProcess = spawn } = {}) {
@@ -61,9 +62,11 @@ export async function startManager(env = process.env, { centralRuntime, spawnPro
   }
     await new Promise((resolve,reject)=>{server.once('error',reject);server.listen(port,env.T3_HOST ?? '0.0.0.0',resolve);});
     await runtime?.restore?.();
-    launch('/opt/t3/t3',['serve','--host','127.0.0.1','--port','3773','--base-dir',env.T3_STATE,'--no-browser',env.T3_CWD],nativeEnv);
+    launch(runtimePath(env, 'opt/t3/t3'),['serve','--host','127.0.0.1','--port','3773','--base-dir',env.T3_STATE,'--no-browser',env.T3_CWD],nativeEnv);
     const terminalEnv=withoutExecutingMcpEnvironment(withoutEdgeEnvironment(env));delete terminalEnv.T3_CLOUD_OWNER_KEY;delete terminalEnv.T3_CLOUD_ALLOCATOR_TOKEN;
-    launch('ttyd',['--interface','127.0.0.1','--port','7681','--base-path','/_cloud/terminal','--writable','tmux','new-session','-A','-s','t3-cloud'],terminalEnv);
+    terminalEnv.PATH = runtimePathEnv(env);
+    launch(env.T3_RELEASE_ROOT ? runtimePath(env, 'usr/local/bin/ttyd') : 'ttyd',
+      ['--interface','127.0.0.1','--port','7681','--base-path','/_cloud/terminal','--writable','tmux','new-session','-A','-s','t3-cloud'],terminalEnv);
     if (nativeServer) await new Promise((resolve,reject)=>{nativeServer.once('error',reject);nativeServer.listen(8081,env.T3_HOST ?? '0.0.0.0',resolve);});
     return {server,nativeServer,close};
   } catch(error) {await close();throw error;}

@@ -1,0 +1,181 @@
+import { createHash, randomUUID } from 'node:crypto';
+import { execFile } from 'node:child_process';
+import { constants } from 'node:fs';
+import { chmod, copyFile, lstat, mkdir, open, readFile, readlink, readdir, rename, rm, stat, symlink, writeFile } from 'node:fs/promises';
+import { dirname, isAbsolute, join, normalize, resolve, sep } from 'node:path';
+import { promisify } from 'node:util';
+
+const digest = bytes => createHash('sha256').update(bytes).digest('hex');
+const exact = (value, keys) => value && typeof value === 'object' && !Array.isArray(value) &&
+  Object.keys(value).length === keys.length && keys.every(key => Object.hasOwn(value, key));
+const sha = value => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value);
+const commit = value => typeof value === 'string' && /^[a-f0-9]{40}$/.test(value);
+const safePath = value => typeof value === 'string' && value.length <= 512 && value.length > 0 &&
+  !isAbsolute(value) && !value.includes('\\') && !value.split('/').some(part => !part || part === '.' || part === '..') &&
+  normalize(value) === value;
+const inside = (root, path) => path === root || path.startsWith(root + sep);
+
+export const REQUIRED_BUNDLE_PATHS = Object.freeze([
+  'opt/t3/t3', 'opt/t3/node', 'opt/t3/source.json', 'opt/t3/resource-monitor',
+  'opt/t3/dist/bin.mjs', 'opt/t3/node_modules/@anthropic-ai/claude-agent-sdk/manifest.json',
+  'opt/t3-cloud/manager-main.mjs', 'opt/t3-cloud/prepare.mjs',
+  'opt/t3-cloud/node_modules/ws/package.json', 'opt/codex/bin/codex',
+  'opt/briq-cli/node_modules/.bin/briq', 'usr/local/bin/claude',
+  'usr/local/bin/ttyd', 'usr/local/bin/t3-cloud-start',
+  'usr/local/bin/show-url', 'opt/t3-cloud/bin/codex-remote',
+  'etc/claude-code/managed-settings.json', 'etc/codex/config.toml',
+]);
+
+export const BUNDLE_ROOTS = Object.freeze([
+  'opt/t3', 'opt/t3-cloud', 'opt/codex', 'opt/briq-cli',
+  'usr/local/bin/claude', 'usr/local/bin/ttyd', 'usr/local/bin/t3-cloud-start',
+  'usr/local/bin/show-url',
+  'etc/claude-code', 'etc/codex', 'etc/t3-cloud',
+]);
+
+async function hashFile(path) {
+  const handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+  try {
+    const info = await handle.stat();
+    if (!info.isFile() || info.nlink !== 1) throw Error('Release contains an unsafe file');
+    const hash = createHash('sha256');
+    for await (const chunk of handle.createReadStream()) hash.update(chunk);
+    return { size: info.size, sha256: hash.digest('hex') };
+  } finally { await handle.close(); }
+}
+
+// The source is the finished image filesystem. Only the declared application roots
+// enter a release; /work, homes and credentials are never candidates.
+export async function inventoryBundle(root, paths = BUNDLE_ROOTS) {
+  if (!isAbsolute(root)) throw Error('Absolute image root required');
+  const entries = [];
+  const parents = new Set();
+  for (const path of paths) for (let parent = dirname(path); parent !== '.'; parent = dirname(parent)) parents.add(parent);
+  for (const path of [...parents].sort()) entries.push({ path, type: 'directory', mode: 0o700 });
+  async function visit(path) {
+    if (!safePath(path)) throw Error('Unsafe release path');
+    const source = join(root, path), info = await lstat(source);
+    if (info.isDirectory()) {
+      entries.push({ path, type: 'directory', mode: info.mode & 0o777 });
+      for (const name of (await readdir(source)).sort()) await visit(`${path}/${name}`);
+    } else if (info.isFile()) {
+      const { size, sha256 } = await hashFile(source);
+      entries.push({ path, type: 'file', mode: info.mode & 0o777, size, sha256 });
+    } else if (info.isSymbolicLink()) {
+      const link = await readlink(source);
+      if (isAbsolute(link) || !inside(resolve(root), resolve(root, dirname(path), link))) throw Error('Unsafe release link');
+      entries.push({ path, type: 'symlink', target: link });
+    } else throw Error('Release contains an unsupported file');
+  }
+  for (const path of paths) await visit(path);
+  const names = new Set(entries.map(entry => entry.path));
+  if (names.size !== entries.length) throw Error('Duplicate release path');
+  for (const path of REQUIRED_BUNDLE_PATHS) if (!names.has(path)) throw Error(`Incomplete release: ${path}`);
+  return entries.sort((a, b) => a.path.localeCompare(b.path));
+}
+
+export function validateManifest(manifest) {
+  if (!exact(manifest, ['protocol', 'project', 'platform', 'baseImage', 'source', 'files']) ||
+      manifest.protocol !== 1 || manifest.project !== 'briq-cloud/t3-cloud' || manifest.platform !== 'linux/amd64' ||
+      !/^sha256:[a-f0-9]{64}$/.test(manifest.baseImage) || !commit(manifest.source) ||
+      !Array.isArray(manifest.files) || manifest.files.length < REQUIRED_BUNDLE_PATHS.length || manifest.files.length > 100000)
+    throw Error('Invalid release manifest');
+  const names = new Set();
+  let total = 0;
+  for (const entry of manifest.files) {
+    if (!safePath(entry?.path) || names.has(entry.path)) throw Error('Invalid release path');
+    names.add(entry.path);
+    if (entry.type === 'file') {
+      if (!exact(entry, ['path', 'type', 'mode', 'size', 'sha256']) || !Number.isSafeInteger(entry.size) || entry.size < 0 || entry.size > 1_000_000_000 || !sha(entry.sha256)) throw Error('Invalid release file');
+      total += entry.size;
+    } else if (entry.type === 'directory') {
+      if (!exact(entry, ['path', 'type', 'mode'])) throw Error('Invalid release directory');
+    } else if (entry.type === 'symlink') {
+      if (!exact(entry, ['path', 'type', 'target']) || typeof entry.target !== 'string' || isAbsolute(entry.target) ||
+          !inside('/bundle', resolve('/bundle', dirname(entry.path), entry.target))) throw Error('Invalid release link');
+    } else throw Error('Invalid release entry');
+    if (entry.type !== 'symlink' && (!Number.isInteger(entry.mode) || entry.mode < 0o400 || entry.mode > 0o755 || entry.mode & 0o022 || entry.mode & 0o4000)) throw Error('Unsafe release mode');
+  }
+  if (total > 4_000_000_000) throw Error('Release exceeds capacity limit');
+  for (const path of REQUIRED_BUNDLE_PATHS) if (!names.has(path)) throw Error(`Incomplete release: ${path}`);
+  const types = new Map(manifest.files.map(entry => [entry.path, entry.type]));
+  for (const entry of manifest.files) {
+    for (let parent = dirname(entry.path); parent !== '.'; parent = dirname(parent)) {
+      if (types.get(parent) !== 'directory') throw Error('Invalid release parent');
+    }
+  }
+  return `sha256:${digest(Buffer.from(JSON.stringify(manifest)))}`;
+}
+
+export async function verifyManifestAttestation(manifestFile, { run = promisify(execFile), cli = 'gh' } = {}) {
+  if (!isAbsolute(manifestFile)) throw Error('Absolute manifest path required');
+  const bytes = await readFile(manifestFile);
+  if (bytes.length > 16_000_000) throw Error('Release manifest exceeds capacity limit');
+  const manifest = JSON.parse(bytes.toString('utf8'));
+  const identity = validateManifest(manifest);
+  const { stdout } = await run(cli, ['attestation', 'verify', manifestFile,
+    '-R', 'briq-cloud/t3-cloud', '--signer-workflow', 'briq-cloud/t3-cloud/.github/workflows/image.yml',
+    '--source-ref', 'refs/heads/main', '--source-digest', manifest.source, '--format', 'json'],
+    { timeout: 30000, maxBuffer: 1_000_000 });
+  if (!bytes.equals(await readFile(manifestFile))) throw Error('Release manifest changed during verification');
+  const rows = JSON.parse(stdout);
+  if (!Array.isArray(rows) || !rows.some(row => {
+    const certificate = row?.verificationResult?.signature?.certificate;
+    return String(certificate?.sourceRepositoryIdentifier) === '1450999885' &&
+      certificate?.sourceRepositoryRef === 'refs/heads/main';
+  })) throw Error('Release provenance unavailable');
+  return { manifest, identity };
+}
+
+export async function packBundle(root, output, { baseImage, source }) {
+  if (!isAbsolute(output) || !/^sha256:[a-f0-9]{64}$/.test(baseImage) || !commit(source)) throw Error('Invalid release inputs');
+  const files = await inventoryBundle(root);
+  const manifest = { protocol: 1, project: 'briq-cloud/t3-cloud', platform: 'linux/amd64',
+    baseImage, source, files };
+  validateManifest(manifest);
+  const blobs = join(output, 'blobs');
+  await mkdir(blobs, { recursive: true, mode: 0o700 });
+  for (const entry of files) {
+    if (entry.type !== 'file') continue;
+    const target = join(blobs, entry.sha256);
+    try { await copyFile(join(root, entry.path), target, constants.COPYFILE_EXCL); }
+    catch (error) { if (error.code !== 'EEXIST') throw error; }
+    const actual = await hashFile(target);
+    if (actual.size !== entry.size || actual.sha256 !== entry.sha256) throw Error('Release source changed while packing');
+  }
+  await writeFile(join(output, 'manifest.json'), JSON.stringify(manifest), { flag: 'wx', mode: 0o600 });
+  return manifest;
+}
+
+// Blobs are named by digest, never by archive-supplied paths. Staged bytes are
+// rehashed after copying, before the immutable directory is made visible.
+export async function stageBundle(manifestFile, blobs, releases, options) {
+  const { manifest, identity } = await verifyManifestAttestation(manifestFile, options);
+  if (!isAbsolute(blobs) || !isAbsolute(releases)) throw Error('Absolute release directories required');
+  const destination = join(releases, identity.replace(':', '-'));
+  await mkdir(releases, { recursive: true, mode: 0o700 });
+  const existing = await stat(destination).catch(error => { if (error.code === 'ENOENT') return null; throw error; });
+  if (existing) throw Error('Release already exists');
+  const temporary = `${destination}.staging-${randomUUID()}`;
+  await mkdir(temporary, { mode: 0o700 });
+  try {
+    for (const entry of manifest.files) {
+      const target = join(temporary, entry.path);
+      if (entry.type === 'directory') await mkdir(target, { recursive: true, mode: 0o700 });
+      else if (entry.type === 'file') {
+        await mkdir(dirname(target), { recursive: true, mode: 0o700 });
+        await copyFile(join(blobs, entry.sha256), target, constants.COPYFILE_EXCL);
+        const actual = await hashFile(target);
+        if (actual.size !== entry.size || actual.sha256 !== entry.sha256) throw Error('Release blob mismatch');
+        await chmod(target, entry.mode);
+      } else {
+        await mkdir(dirname(target), { recursive: true, mode: 0o700 });
+        await symlink(entry.target, target);
+      }
+    }
+    await rename(temporary, destination);
+    const dir = await open(releases, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+    try { await dir.sync(); } finally { await dir.close(); }
+    return { identity, path: destination };
+  } catch (error) { await rm(temporary, { recursive: true, force: true }); throw error; }
+}

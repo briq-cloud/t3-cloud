@@ -67,7 +67,8 @@ async function hashFile(path) {
   const handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
   try {
     const info = await handle.stat();
-    if (!info.isFile() || info.nlink !== 1) throw Error('Release contains an unsafe file');
+    if (!info.isFile()) throw Error('Release contains an unsafe file');
+    if (info.nlink !== 1) throw Error('Release contains a hardlinked file');
     const hash = createHash('sha256');
     for await (const chunk of handle.createReadStream()) hash.update(chunk);
     return { size: info.size, sha256: hash.digest('hex') };
@@ -205,12 +206,15 @@ export async function verifyManifestAttestation(manifestFile, { run = promisify(
   } finally { await rm(snapshot, { recursive: true, force: true }); }
 }
 
-export async function packBundle(root, output, { baseImage, source, childImage }) {
+export async function packBundle(root, output, { baseImage, source, childImage, onPhase = () => {} }) {
   if (!isAbsolute(output) || !/^sha256:[a-f0-9]{64}$/.test(baseImage) || !commit(source)) throw Error('Invalid release inputs');
+  onPhase('inventory');
   const files = await inventoryBundle(root);
   const manifest = { protocol: 1, project: 'briq-cloud/t3-cloud', platform: 'linux/amd64',
     baseImage, source, childImage, files };
+  onPhase('manifest');
   validateManifest(manifest);
+  onPhase('blobs');
   const blobs = join(output, 'blobs');
   await mkdir(blobs, { recursive: true, mode: 0o700 });
   for (const entry of files) {

@@ -53,3 +53,42 @@ test('clean shutdown allows the same committed runtime on next boot', async t =>
   const next = new RuntimeSupervisor({ state: f.state, baseImage, driver: f.driver });
   assert.deepEqual(await next.initialize(), { recoveryRequired: false });
 });
+
+for (const [name, patch] of [
+  ['pending transition', { desired: version, phase: 'starting', receipt: { from: 'bootstrap', to: version, status: 'pending' } }],
+  ['starting without receipt', { phase: 'starting' }],
+  ['contradictory committed receipt', { receipt: { from: 'bootstrap', to: version, status: 'committed' } }],
+  ['missing desired', { desired: undefined }],
+  ['invalid staged', { staged: 'bootstrap' }],
+  ['invalid revision', { revision: '10' }],
+]) {
+  test(`cold recovery retains quarantine for ${name} with zero process actions`, async t => {
+    const f = await fixture(t);
+    await (await import('node:fs/promises')).writeFile(join(f.state, 'updates/activation.json'), JSON.stringify({
+      protocol: 1, revision: 10, current: 'bootstrap', staged: null, desired: null, phase: 'running', receipt: null, ...patch,
+    }));
+    let actions = 0;
+    const ownership = { evidence: 'cold', revision: 'a'.repeat(64), reconcile() { actions++; } };
+    const next = new RuntimeSupervisor({ state: f.state, baseImage, driver: {
+      start() { actions++; }, stop() { actions++; }, health() { actions++; },
+    } });
+    assert.deepEqual(await next.initialize({ ownership }), { recoveryRequired: true });
+    assert.equal(next.recoverable(), false);
+    await assert.rejects(next.reconcile({ action: 'recover-known-current', expectedJournalRevision: 10,
+      expectedOwnershipRevision: ownership.revision }), /unresolved/);
+    assert.equal(actions, 0); assert.equal(next.admitting, false);
+  });
+}
+test('verified pre-feature runtime without recovery contract is not started during recovery', async t => {
+  const f = await fixture(t);
+  await (await import('node:fs/promises')).writeFile(join(f.state, 'updates/activation.json'), JSON.stringify({
+    protocol: 1, revision: 10, current: version, staged: null, desired: null, phase: 'running', receipt: null,
+  }));
+  let actions = 0;
+  const ownership = { evidence: 'cold', revision: 'a'.repeat(64), reconcile() { actions++; } };
+  const next = new RuntimeSupervisor({ state: f.state, baseImage, driver: { start() { actions++; } }, verify: async () => ({ files: [] }) });
+  await next.initialize({ ownership });
+  await assert.rejects(next.reconcile({ action: 'recover-known-current', expectedJournalRevision: 10,
+    expectedOwnershipRevision: ownership.revision }), /does not support safe cold recovery/);
+  assert.equal(actions, 0);
+});

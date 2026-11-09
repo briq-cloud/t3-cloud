@@ -1,6 +1,7 @@
+import { acquireRuntimeOwnership } from './runtime-ownership.mjs';
 import { ClaudeRuntime } from './claude-runtime.mjs';
 import { edgeToken, edgeAuthorized, requireEdgeBinding } from './edge-auth.mjs';
-import { mkdir, open, rm } from 'node:fs/promises';
+import { mkdir } from 'node:fs/promises';
 import { join, isAbsolute } from 'node:path';
 import { WebSocketServer, WebSocket } from 'ws';
 import { AllocationStore, ThreadAllocator, identifier, threadIdentifier, providerInstanceId } from './allocations.mjs';
@@ -64,7 +65,10 @@ export async function createCentralRuntime(env = process.env, dependencies = {})
   if (!directory || !isAbsolute(directory)) throw Error('Absolute central state directory required');
   await mkdir(directory, { recursive: true, mode: 0o700 });
   const lock = join(directory, 'central.lock');
-  await mkdir(lock, { mode: 0o700 });
+  const ownership = await (dependencies.acquireOwnership ?? acquireRuntimeOwnership)({ directory, name: 'central',
+    environmentBinding: dependencies.environmentBinding ?? env.T3_CLOUD_OWNER_ID, legacy: lock });
+  if (ownership.evidence === 'cold' && env.T3_CLOUD_RECOVERY === '1') await ownership.reconcile(ownership.revision);
+  else if (!['fresh', 'clean'].includes(ownership.evidence)) { await ownership.close(); throw Error('Central ownership requires reconciliation'); }
   let app, websocket, claude, briqTransport; const peers = new Set(); let stopped = false;
   const bridgeLeases = new Map();
   const closeManagedBridge = binding => {
@@ -79,11 +83,9 @@ export async function createCentralRuntime(env = process.env, dependencies = {})
     websocket?.close(); briqTransport?.close();
     await claude?.close();
     await app?.close();
-    await rm(lock, { recursive: true });
+    await ownership.close({ clean: true });
   }
   try {
-    const handle = await open(join(lock, 'owner.json'), 'wx', 0o600);
-    try { await handle.writeFile(JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString() })); } finally { await handle.close(); }
     const store = new AllocationStore(join(directory, 'allocations')); await store.initialize();
     for (const binding of [...await store.list(), ...await store.listSources()]) if (binding.state !== 'revoked') requireEdgeBinding(binding, edgeCredential);
     app = await (dependencies.startAppServer ?? startAppServer)({ binary: env.T3_CLOUD_CODEX_BINARY ??
@@ -103,6 +105,21 @@ export async function createCentralRuntime(env = process.env, dependencies = {})
       if (ready && !retryRestore) return Promise.resolve();
       retryRestore = false;
       restoring = (async () => {
+        if (env.T3_CLOUD_RECOVERY === '1') {
+          // Owner-approved cold recovery admits new work, but never replays a
+          // persisted provider binding, pending turn, cleanup or login attempt.
+          for (const binding of await store.list()) {
+            if (binding.state !== 'ready') continue;
+            await store.serialized(binding.threadId, async () => {
+              const current = await store.load(binding.threadId);
+              if (current?.allocationId !== binding.allocationId || current.state !== 'ready') return;
+              current.restoreState = 'reconciliation-required';
+              await store.save(current);
+            });
+          }
+          ready = true;
+          return;
+        }
         // The manager must bind the loopback MCP route before native restoration.
         for (let binding of await store.list()) {
           if (binding.state === 'revoked') {

@@ -6,6 +6,8 @@ import { createServer } from 'node:net';
 import { once } from 'node:events';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { acquireRuntimeOwnership } from './runtime-ownership.mjs';
+import { testIdentity, testLock, testOwnership } from './fixtures/runtime-ownership.mjs';
 import { startLoader } from './runtime-loader.mjs';
 import { runtimeProcess } from './runtime-process.mjs';
 import { RuntimeSupervisor } from './runtime-supervisor.mjs';
@@ -20,17 +22,21 @@ async function unusedPort() {
   const server = createServer(); server.listen(0, '127.0.0.1'); await once(server, 'listening');
   const port = server.address().port; await new Promise(resolve => server.close(resolve)); return port;
 }
-async function fixture(t, { recovery = false, unknown = false } = {}) {
+async function fixture(t, { recovery = false, unknown = false, journal, ownershipEvidence } = {}) {
   const state = await mkdtemp(join(tmpdir(), 't3-loader-integration-'));
   let loader;
   t.after(async () => { await loader?.close(); await rm(state, { recursive: true, force: true }); });
   const baseImageFile = join(state, 'base-image'), sourceFile = join(state, 'source');
   await writeFile(baseImageFile, `sha256:${'c'.repeat(64)}`);
   if (!unknown) await writeFile(sourceFile, 'd'.repeat(40));
-  if (recovery) {
+  if (recovery || journal) {
     const { mkdir } = await import('node:fs/promises'); await mkdir(join(state, 'updates'));
-    await writeFile(join(state, 'updates/activation.json'), JSON.stringify({ protocol: 1, current: 'bootstrap', staged: identity,
+    await writeFile(join(state, 'updates/activation.json'), JSON.stringify(journal ?? { protocol: 1, current: 'bootstrap', staged: identity,
       desired: identity, phase: 'starting', receipt: { from: 'bootstrap', to: identity, status: 'pending' } }));
+  }
+  if (ownershipEvidence) {
+    const prior = await testOwnership({ directory: join(state, 'updates'), name: 'loader', environmentBinding: 'owner' });
+    await prior.close();
   }
   // A real Node child runs the real authenticated HTTP manager and IPC client.
   // The native process and release verifier are bounded test doubles; no vendor
@@ -56,13 +62,13 @@ async function fixture(t, { recovery = false, unknown = false } = {}) {
     });
     process.once('disconnect', () => process.exit(0));
   `);
-  let starts = 0, updateWork;
+  let starts = 0, updateWork; const recoveries = [];
   const port = await unusedPort();
   loader = await startLoader({ PORT: String(port), T3_HOST: '127.0.0.1', T3_CWD: state, T3_CLOUD_STATE: state,
     T3_CLOUD_PUBLIC_ORIGIN: origin, T3_CLOUD_OWNER_KEY: key, T3_CLOUD_OWNER_ID: 'owner' }, {
-    baseImageFile, sourceFile,
+    baseImageFile, sourceFile, acquireOwnership: ownershipEvidence ? options => acquireRuntimeOwnership({ ...options, lock: testLock, identity: async () => ({ ...testIdentity, ...(ownershipEvidence === 'cold' ? { bootId: '22222222-2222-2222-2222-222222222222' } : {}) }) }) : testOwnership,
     createDriver: env => runtimeProcess(env, { spawnProcess: (_command, _args, options) => {
-      starts++; return spawn(process.execPath, [childFile], options);
+      starts++; recoveries.push(options.env.T3_CLOUD_RECOVERY); return spawn(process.execPath, [childFile], options);
     } }),
     createSupervisor: options => new RuntimeSupervisor({ ...options, verify: async () => ({ source }), stage: async () => ({ identity }) }),
     createUpdates: options => {
@@ -81,7 +87,7 @@ async function fixture(t, { recovery = false, unknown = false } = {}) {
     const text = await response.text();
     return { status: response.status, headers: response.headers, text, value: (() => { try { return JSON.parse(text); } catch { return null; } })() };
   };
-  return { state, loader, send, starts: () => starts, waitUpdate: async () => { await new Promise(resolve => setImmediate(resolve)); await updateWork; } };
+  return { state, loader, send, recoveries, starts: () => starts, waitUpdate: async () => { await new Promise(resolve => setImmediate(resolve)); await updateWork; } };
 }
 
 test('authenticated owner update crosses real IPC; drain status stays available and committed receipt survives manager replacement', async t => {
@@ -126,4 +132,35 @@ test('ambiguous restart exposes only owner-authenticated recovery UI without sta
   assert.equal((await f.send('/_cloud/briq/mcp', { method: 'POST' })).status, 503);
   assert.equal((await f.send('/_cloud/terminal/')).status, 503);
   await f.loader.updates.update(); assert.equal(f.loader.supervisor.journal.phase, 'starting'); assert.equal(f.starts(), 0);
+});
+
+test('owner cold reconciliation CAS recovers verified current and preserves staged state without implicit startup', async t => {
+  const f = await fixture(t, { ownershipEvidence: 'cold', journal: { protocol: 1, revision: 10, current: 'bootstrap',
+    desired: null, staged: identity, phase: 'running', receipt: null } });
+  assert.equal(f.starts(), 0);
+  const status = (await f.send('/_cloud/updates/status')).value;
+  assert.equal(status.recovery.available, true); assert.equal(status.recovery.ownership, 'cold');
+  const input = { action: 'recover-known-current', expectedJournalRevision: status.recovery.journalRevision,
+    expectedOwnershipRevision: status.recovery.ownershipRevision };
+  assert.equal((await f.send('/_cloud/updates/reconcile', { method: 'POST', input, auth: false })).status, 401);
+  assert.equal((await f.send('/_cloud/updates/reconcile', { method: 'POST', input, requestOrigin: 'https://evil.example' })).status, 403);
+  assert.notEqual((await f.send('/_cloud/updates/reconcile', { method: 'POST', input: { ...input, expectedJournalRevision: 9 } })).status, 200);
+  assert.equal(f.starts(), 0);
+  assert.equal((await f.send('/_cloud/updates/reconcile', { method: 'POST', input })).status, 200);
+  assert.equal(f.starts(), 1); assert.deepEqual(f.recoveries, ['1']);
+  assert.equal(f.loader.supervisor.journal.phase, 'running'); assert.equal(f.loader.supervisor.journal.staged, identity);
+  assert.equal(f.loader.supervisor.journal.receipt, null); assert.equal(f.loader.supervisor.admitting, true);
+  assert.notEqual((await f.send('/_cloud/updates/reconcile', { method: 'POST', input })).status, 200);
+});
+
+test('same-boot orphan manager on 8082 receives no traffic from the recovery frontdoor', async t => {
+  const { createServer } = await import('node:http'); let oldRequests = 0;
+  const old = createServer((_req, res) => { oldRequests++; res.end('unowned manager'); });
+  await new Promise(resolve => old.listen(8082, '127.0.0.1', resolve));
+  t.after(() => new Promise(resolve => old.close(resolve)));
+  const f = await fixture(t, { ownershipEvidence: 'orphan', journal: { protocol: 1, revision: 1,
+    current: 'bootstrap', desired: null, staged: null, phase: 'running', receipt: null } });
+  const status = await f.send('/_cloud/updates/status');
+  assert.equal(status.status, 200); assert.equal(status.value.recovery.ownership, 'orphan'); assert.equal(status.value.recovery.available, false);
+  assert.equal((await f.send('/native')).status, 503); assert.equal(f.starts(), 0); assert.equal(oldRequests, 0);
 });

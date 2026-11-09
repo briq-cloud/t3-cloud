@@ -1,3 +1,4 @@
+import { testOwnership } from './fixtures/runtime-ownership.mjs';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtemp, rm, stat } from 'node:fs/promises';
@@ -21,7 +22,7 @@ async function fixture(t) {
   if(method==='thread/resume')installed.set(params.threadId,params.config['mcp_servers.briq'].http_headers.Authorization);
   if(method==='mcpServerStatus/list'){observed.add(installed.get(params.threadId));return{data:[{name:'briq',tools:{briq_docs:{}}}]};}
   return {model:'mock',thread:{model:'mock',id:'native',sessionId:'native-session',environments:[{environmentId:'exec',cwd:'/work'}],turns:[]}};}};
- return {directory,env,app,calls,runtimes,observed,installed,bindings,closed:()=>closed,deps:{startAppServer:async()=>app,createScopedMcpTransport,cloud:{}}};
+ return {directory,env,app,calls,runtimes,observed,installed,bindings,closed:()=>closed,deps:{acquireOwnership:testOwnership,startAppServer:async()=>app,createScopedMcpTransport,cloud:{}}};
 }
 test('composition holds singleton lock until app-server termination is confirmed',async t=>{
  const f=await fixture(t);let finish;
@@ -35,12 +36,12 @@ test('composition holds singleton lock until app-server termination is confirmed
 test('startup failure closes owned app-server and releases lock after exit',async t=>{
  const f=await fixture(t);
  await assert.rejects(createCentralRuntime({...f.env,T3_CLOUD_CHILD_IMAGE:'unpinned'},f.deps),/digest/);
- assert.equal(f.closed(),1);await assert.rejects(stat(join(f.directory,'central.lock')),{code:'ENOENT'});
+ assert.equal(f.closed(),1);assert.equal(JSON.parse(await (await import('node:fs/promises')).readFile(join(f.directory,'central.ownership.json'),'utf8')).state,'clean');
 });
 test('composition keeps global Briq credentials out of executing provider options under the owner lock',async t=>{
  const f=await fixture(t);let options;
  const env={...f.env,BRIQ_MCP_TOKEN:'explicit-test-grant',BRIQ_API_URL:'https://api.example/v1',BRIQ_API_KEY:'not-an-mcp-grant',OPENAI_API_KEY:'not-forwarded',HOME:'/native-owner-home'};
- const runtime=await createCentralRuntime(env,{...f.deps,startAppServer:async value=>{await stat(join(f.directory,'central.lock/owner.json'));options=value;return f.app;}});f.runtimes.push(runtime);await runtime.restore();
+ const runtime=await createCentralRuntime(env,{...f.deps,startAppServer:async value=>{await stat(join(f.directory,'central.ownership.json'));options=value;return f.app;}});f.runtimes.push(runtime);await runtime.restore();
  assert.deepEqual(options,{binary:'codex',home:join(f.directory,'codex')});
 });
 test('restart restores remote registration then verifies sticky native thread before serving',async t=>{
@@ -389,4 +390,16 @@ test('authenticated turn settling during a later durable idle read invalidates t
  assert.equal(result.counts.receiving,0);assert.equal(result.counts.unresolved,0);assert.equal(result.counts.activityChanged,1);assert.equal(result.idle,false);
  assert.equal(Object.entries(result.counts).filter(([key])=>key!=='activityChanged').every(([,value])=>value===0),true);
  const next=await runtime.updateActivity();assert.equal(next.counts.activityChanged,0);assert.ok(next.counts.unresolved>=1);assert.equal(next.idle,false);
+});
+
+test('owner-approved cold recovery preserves unknown bindings with zero native, registration, login or pairing replay', async t => {
+ const f=await fixture(t);const store=new AllocationStore(join(f.directory,'allocations'));await store.initialize();
+ const binding={edgeTokenHash:digest(f.env.T3_CLOUD_EDGE_TOKEN),state:'ready',threadId:'t3',allocationId:'allocation',nativeThreadId:'native',turnState:'unknown',nativeState:'unknown',bridgeToken:'bridge',execEnvironmentId:'exec',execUrl:'wss://child.example/_cloud/exec',execToken:'capability'};
+ await store.save(binding);
+ let pairs=0,logins=0,kills=0;
+ const runtime=await createCentralRuntime({...f.env,T3_CLOUD_RECOVERY:'1'},{...f.deps,cloud:{pair(){pairs++;throw Error('no pairing');},login(){logins++;throw Error('no login');},destroy(){kills++;throw Error('no kill');}}});f.runtimes.push(runtime);
+ await runtime.restore();await runtime.restore();
+ assert.equal(runtime.ready(),true);assert.deepEqual(f.calls,[]);assert.deepEqual([pairs,logins,kills],[0,0,0]);
+ const persisted=await store.load('t3');assert.equal(persisted.nativeThreadId,'native');assert.equal(persisted.nativeState,'unknown');assert.equal(persisted.turnState,'unknown');assert.equal(persisted.restoreState,'reconciliation-required');
+ assert.deepEqual(await runtime.allocator.phoneChildren('owner'),[]);
 });

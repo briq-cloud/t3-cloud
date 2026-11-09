@@ -26,7 +26,7 @@ async function body(req) {
 const only = (value, keys) => Object.keys(value).every(key => keys.includes(key));
 const id = value => typeof value === 'string' && /^[a-zA-Z0-9_-]{1,128}$/.test(value);
 export function runtimeManagementPath(path) {
-  return ['/_cloud', '/_cloud/', '/_cloud/login', '/_cloud/logout', '/_cloud/updates', '/_cloud/updates/status', '/_cloud/updates/check', '/_cloud/updates/update', '/_cloud/updates/automatic'].includes(path);
+  return ['/_cloud', '/_cloud/', '/_cloud/login', '/_cloud/logout', '/_cloud/updates', '/_cloud/updates/status', '/_cloud/updates/check', '/_cloud/updates/update', '/_cloud/updates/automatic', '/_cloud/updates/reconcile'].includes(path);
 }
 const denySocket = socket => { socket.end('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n'); };
 
@@ -158,7 +158,15 @@ export function createCloudManager({ role, publicOrigin, ownerKey, ownerId, allo
       if (!authorized) return json(res, 401, { error: 'Open /_cloud/ and sign in with your owner key' });
       if (url.pathname === '/_cloud/logout' && req.method === 'POST') return json(res, 200, { authenticated: false }, { 'set-cookie': auth.logout(req) });
       if (runtimeUpdates && url.pathname === '/_cloud/updates/status' && req.method === 'GET') return json(res, 200, await runtimeUpdates.status());
-      if (runtimeUpdates && ['/_cloud/updates/check', '/_cloud/updates/update', '/_cloud/updates/automatic'].includes(url.pathname) && req.method === 'POST') {
+      if (runtimeUpdates && url.pathname === '/_cloud/updates/reconcile' && req.method === 'POST') {
+        const input = await body(req);
+        if (!only(input, ['action', 'expectedJournalRevision', 'expectedOwnershipRevision']) ||
+            input.action !== 'recover-known-current' || !Number.isSafeInteger(input.expectedJournalRevision) || input.expectedJournalRevision < 0 ||
+            !/^[a-f0-9]{64}$/.test(input.expectedOwnershipRevision ?? '') || typeof runtimeUpdates.reconcile !== 'function')
+          return json(res, 400, { error: 'Invalid recovery operation' });
+        return json(res, 200, await runtimeUpdates.reconcile(input));
+      }
+      if (runtimeUpdates && ['/_cloud/updates/check', '/_cloud/updates/update', '/_cloud/updates/automatic', '/_cloud/updates/reconcile'].includes(url.pathname) && req.method === 'POST') {
         const input = await body(req);
         if (url.pathname.endsWith('/automatic')) {
           if (!only(input, ['enabled']) || typeof input.enabled !== 'boolean') return json(res, 400, { error: 'Invalid update preference' });

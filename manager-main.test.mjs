@@ -1,3 +1,4 @@
+import { testOwnership } from './fixtures/runtime-ownership.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { startManager } from './manager-main.mjs';
@@ -78,7 +79,7 @@ test('manager restart launches recovery UI and device sign-in despite persisted 
   throw Error('Unexpected native effect');
  }};
  const runtime=await startManager(env,{
-  centralRuntime:async value=>(central=await createCentralRuntime(value,{startAppServer:async()=>app,cloud:{}})),
+  centralRuntime:async value=>(central=await createCentralRuntime(value,{acquireOwnership:testOwnership,startAppServer:async()=>app,cloud:{}})),
   spawnProcess:()=>{spawned++;const child=new EventEmitter();child.kill=()=>true;return child;},
  });managed=runtime;
  assert.equal(central.ready(),true);assert.equal(spawned,2);assert.equal((await store.load('t3')).restoreState,'deferred');

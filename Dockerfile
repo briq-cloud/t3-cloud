@@ -130,10 +130,13 @@ COPY . /opt/t3-cloud
 RUN ln -sf /opt/t3/node /usr/local/bin/node \
   && test "$(node --version)" = "v$(node -p 'require("/opt/t3/source.json").node')" \
   && test -x /bin/bash \
+  && test -x /usr/bin/flock \
+  && /usr/bin/flock --exclusive --nonblock /tmp/t3-flock-build-proof /bin/true \
   && cd /opt/t3-cloud \
   && npm ci --omit=dev --ignore-scripts --no-fund --no-audit \
+  && node --test runtime-ownership.test.mjs \
   && npm cache clean --force
-COPY runtime-loader.mjs runtime-supervisor.mjs runtime-process.mjs runtime-bundle.mjs /opt/t3-bootstrap/
+COPY runtime-loader.mjs runtime-supervisor.mjs runtime-process.mjs runtime-bundle.mjs runtime-ownership.mjs /opt/t3-bootstrap/
 COPY bin/t3-cloud-start /usr/local/bin/t3-cloud-start
 RUN chmod 755 /usr/local/bin/t3-cloud-start /opt/t3-cloud/bin/codex-remote /opt/t3-cloud/bin/release-shims/runtime-command
 EXPOSE 8080

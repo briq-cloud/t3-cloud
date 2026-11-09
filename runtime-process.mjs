@@ -18,9 +18,9 @@ export function runtimeProcess(env, { spawnProcess = spawn } = {}) {
     });
   }
   return {
-    async start(root, release) {
+    async start(root, release, { recovery = false } = {}) {
       if (!exited) throw Error('Owned manager already running');
-      const selected = { ...env, PORT: '8082', T3_HOST: '127.0.0.1', T3_CLOUD_NATIVE_PORT: '8083', T3_CLOUD_SUPERVISED: '1',
+      const selected = { ...env, T3_CLOUD_RECOVERY: recovery ? '1' : '0', PORT: '8082', T3_HOST: '127.0.0.1', T3_CLOUD_NATIVE_PORT: '8083', T3_CLOUD_SUPERVISED: '1',
         ...(release ? { T3_CLOUD_CHILD_IMAGE: release.childImage } : {}) };
       if (root === '/') delete selected.T3_RELEASE_ROOT; else selected.T3_RELEASE_ROOT = root;
       const shims = join(root, 'opt/t3-cloud/bin/release-shims');

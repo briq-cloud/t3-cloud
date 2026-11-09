@@ -250,3 +250,15 @@ test('shutdown joins a held periodic check and prevents its automatic update or 
   assert.equal(callbacks.length, 1);
   assert.deepEqual(calls, ['check']);
 });
+
+test('committed activation receipt repairs only exact selected-release preferences', async t => {
+  const f = await fixture(t); await f.controller.check();
+  await f.controller.save({ outcome: 'pending', staged: { source, identity: digest } });
+  Object.assign(f.journal, { protocol: 1, current: digest, desired: null, staged: null, phase: 'running',
+    receipt: { from: 'bootstrap', to: digest, status: 'committed' } });
+  const repaired = new RuntimeUpdates({ ...f.options, currentSource: source }); await repaired.initialize();
+  assert.equal((await repaired.status()).outcome, 'activated'); assert.equal(repaired.record.staged, null);
+  await repaired.save({ outcome: 'pending' }); f.journal.phase = 'starting';
+  const ambiguous = new RuntimeUpdates({ ...f.options, currentSource: source }); await ambiguous.initialize();
+  assert.equal((await ambiguous.status()).outcome, 'pending');
+});

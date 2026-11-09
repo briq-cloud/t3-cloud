@@ -146,7 +146,16 @@ export class RuntimeUpdates {
       }
       this.record = Object.fromEntries(Object.keys(this.record).map(key => [key, input[key]]));
     }
-    await this.save({});
+    const runtime = await this.getRuntime();
+    // The durable activation commit can precede the updater's preferences write.
+    // Repair only that exact completed release, never a pending/start outcome.
+    const committed = runtime.protocol === 1 && runtime.desired === null &&
+      ['running', 'stopped'].includes(runtime.phase) && runtime.receipt?.status === 'committed' &&
+      runtime.receipt.to === runtime.current && identity(runtime.current);
+    await this.save(committed ? {
+      ...(this.record.available?.source === this.currentSource ? { outcome: 'activated' } : {}),
+      ...(this.record.staged?.identity === runtime.current && runtime.staged === null ? { staged: null } : {}),
+    } : {});
     return this.status();
   }
   async save(patch) { const next = { ...this.record, ...patch }; await durableJson(this.file, next); this.record = next; }

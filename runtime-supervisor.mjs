@@ -1,10 +1,21 @@
-import { randomUUID } from 'node:crypto';
+import { randomUUID, createHash } from 'node:crypto';
 import { constants } from 'node:fs';
 import { mkdir, open, readFile, rename } from 'node:fs/promises';
 import { isAbsolute, join } from 'node:path';
 import { stageBundle, verifyInstalledBundle } from './runtime-bundle.mjs';
 
+const recoveryMarkerDigest = createHash('sha256').update('{"protocol":1,"persistedBindings":"quarantine"}\n').digest('hex');
 const identity = value => /^sha256:[a-f0-9]{64}$/.test(value ?? '');
+function validJournal(j) {
+  return j && typeof j === 'object' && !Array.isArray(j) && j.protocol === 1 &&
+    (j.current === 'bootstrap' || identity(j.current)) &&
+    (j.staged === null || identity(j.staged)) && (j.desired === null || identity(j.desired)) &&
+    ['running', 'stopped', 'starting', 'draining', 'stopping', 'recovery-required'].includes(j.phase) &&
+    (j.revision === undefined || Number.isSafeInteger(j.revision) && j.revision >= 0) &&
+    (j.receipt === null || j.receipt && (j.receipt.from === 'bootstrap' || identity(j.receipt.from)) && identity(j.receipt.to) &&
+      (j.receipt.status === 'committed' && j.receipt.to === j.current && j.desired === null ||
+        j.receipt.status === 'pending' && j.receipt.from === j.current && j.receipt.to === j.desired));
+}
 export async function durableJson(path, value) {
   const temporary = `${path}.${randomUUID()}`;
   const handle = await open(temporary, 'wx', 0o600);
@@ -25,7 +36,7 @@ export class RuntimeSupervisor {
     this.busy = false;
   }
   async save(patch) {
-    const next = { ...this.journal, ...patch };
+    const next = { ...this.journal, ...patch, revision: (this.journal?.revision ?? 0) + 1 };
     await durableJson(this.file, next);
     this.journal = next;
   }
@@ -36,24 +47,30 @@ export class RuntimeSupervisor {
       return this.verify(this.releaseRoot(value), value, this.baseImage);
     }
   }
-  async initialize() {
+  async initialize({ ownership } = {}) {
+    this.ownership = ownership;
     await mkdir(join(this.state, 'updates'), { recursive: true, mode: 0o700 });
     try { this.journal = JSON.parse(await readFile(this.file, 'utf8')); }
     catch (error) {
-      if (error.code !== 'ENOENT') throw error;
+      if (error.code !== 'ENOENT') {
+        this.journal = { protocol: 0, phase: 'unavailable', revision: 0 };
+        return { recoveryRequired: true };
+      }
       this.journal = { protocol: 1, current: 'bootstrap', staged: null, desired: null, phase: 'stopped', receipt: null };
       await this.save({});
     }
     const j = this.journal;
-    if (j.protocol !== 1 ||
-        j.current !== 'bootstrap' && !identity(j.current)) throw Error('Invalid activation journal');
+    if (!validJournal(j)) {
+      this.journal = j && typeof j === 'object' ? j : { protocol: 0, phase: 'unavailable', revision: 0 };
+      return { recoveryRequired: true };
+    }
     // A loader/manager crash can leave provider outcomes ambiguous even when the
     // selected version did not change. No native session is resumed implicitly.
-    if (j.phase !== 'stopped' || j.desired) return { recoveryRequired: true };
+    if (ownership && !['fresh', 'clean'].includes(ownership.evidence) || j.phase !== 'stopped' || j.desired) return { recoveryRequired: true };
     const release = await this.verifyRelease(j.current);
     await this.save({ phase: 'starting' });
     try {
-      await this.driver.start(this.releaseRoot(j.current), release);
+      await this.driver.start(this.releaseRoot(j.current), release, { recovery: Boolean(j.recovery) });
       await this.driver.health();
       await this.save({ phase: 'running' });
       this.admitting = true;
@@ -63,6 +80,42 @@ export class RuntimeSupervisor {
       try { await this.driver.stop(); } catch { /* Unknown lifetime remains quarantined. */ }
       throw error;
     }
+  }
+  recoverable() {
+    const j = this.journal;
+    return this.ownership?.evidence === 'cold' && validJournal(j) &&
+      (j.current === 'bootstrap' || identity(j.current)) && j.desired === null &&
+      ['running', 'stopped'].includes(j.phase) &&
+      (j.receipt === null || j.receipt?.status === 'committed' && j.receipt.to === j.current &&
+        (j.receipt.from === 'bootstrap' || identity(j.receipt.from)));
+  }
+  async reconcile({ action, expectedJournalRevision, expectedOwnershipRevision }) {
+    return this.exclusive(async () => {
+      const j = this.journal;
+      if (action !== 'recover-known-current' || expectedJournalRevision !== (j.revision ?? 0) ||
+          expectedOwnershipRevision !== this.ownership?.revision || !this.recoverable()) throw Error('Recovery evidence unresolved');
+      // No phase or current is inferred from a listening port. Reverify the exact
+      // committed artifact, preserving a separately staged release for later.
+      const release = await this.verifyRelease(j.current);
+      if (j.current !== 'bootstrap' && !release?.files?.some(entry => entry.path === 'opt/t3-cloud/runtime-recovery.json' &&
+          entry.type === 'file' && entry.sha256 === recoveryMarkerDigest)) throw Error('Selected runtime does not support safe cold recovery');
+      if (j.staged !== null) await this.verifyRelease(j.staged);
+      const disk = JSON.parse(await readFile(this.file, 'utf8'));
+      if (JSON.stringify(disk) !== JSON.stringify(j)) throw Error('Activation journal changed');
+      await this.ownership.reconcile(expectedOwnershipRevision);
+      await this.save({ phase: 'starting', recovery: 'persisted-bindings-quarantined' });
+      try {
+        await this.driver.start(this.releaseRoot(j.current), release, { recovery: true });
+        await this.driver.health();
+        await this.save({ phase: 'running' });
+        this.admitting = true;
+        return { reconciled: true };
+      } catch (error) {
+        await this.save({ phase: 'recovery-required' });
+        try { await this.driver.stop(); } catch { /* Retain unknown lifetime. */ }
+        throw error;
+      }
+    });
   }
   async exclusive(work) {
     if (this.busy) throw Error('Update already in progress');

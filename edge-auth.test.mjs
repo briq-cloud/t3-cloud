@@ -9,6 +9,7 @@ import WebSocket from 'ws';
 import { bridgeOptions, edgeToken } from './edge-auth.mjs';
 import { AllocationStore, ThreadAllocator, digest } from './allocations.mjs';
 import { createCentralRuntime } from './central-runtime.mjs';
+import { testOwnership } from './fixtures/runtime-ownership.mjs';
 const edge = 'e'.repeat(32), capability = 'a'.repeat(43);
 test('shim uses a clean exact bridge URL with two separate headers and no Origin', () => {
  const env={T3_CLOUD_EDGE_TOKEN:edge,T3_CLOUD_BRIDGE_TOKEN:capability,T3_CLOUD_BRIDGE_URL:'wss://central.example/_cloud/bridge'};
@@ -28,7 +29,7 @@ async function fixture(t) {
  return {directory,store,app,calls,env,cleanups,deps:{startAppServer:async()=>app,cloud:{}}};
 }
 test('real upgrade requires edge cookie plus allocation capability and rejects request smuggling surfaces',async t=>{
- const f=await fixture(t);const runtime=await createCentralRuntime(f.env,f.deps);
+ const f=await fixture(t);const runtime=await createCentralRuntime(f.env,{...f.deps,acquireOwnership:testOwnership});
  const sockets=new Set(), clients=new Set();
  const server=createServer();server.on('connection',socket=>{sockets.add(socket);socket.once('close',()=>sockets.delete(socket));});server.on('upgrade',runtime.bridgeUpgrade);server.listen(0,'127.0.0.1');await once(server,'listening');
  f.cleanups.push(async()=>{for(const peer of clients)peer.terminate();for(const socket of sockets)socket.destroy();try{await runtime.close();}finally{await new Promise(resolve=>server.close(resolve));}});

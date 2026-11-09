@@ -189,3 +189,64 @@ test('release checks during a drain do not change activation source attribution'
   assert.equal((await controller.status()).currentSource, source);
   assert.equal((await controller.status()).outcome, 'available');
 });
+
+test('shutdown joins the held update once and fences new operations until it settles', async t => {
+  for (const held of ['stage', 'activate']) {
+    const { controller, options, calls, journal } = await fixture(t);
+    await controller.check();
+    let release, entered;
+    const gate = new Promise(resolve => { release = resolve; });
+    const started = new Promise(resolve => { entered = resolve; });
+    const hold = async () => {
+      calls.push(held); entered(); await gate;
+      if (held === 'stage') journal.staged = digest;
+      return { pending: false, identity: digest };
+    };
+    if (held === 'stage') options.consumer.stage = hold;
+    else controller.activate = hold;
+    const update = controller.update();
+    await started;
+    let stopped = false;
+    const stopping = controller.stop();
+    stopping.then(() => { stopped = true; });
+    assert.equal(controller.stop(), stopping);
+    await assert.rejects(controller.check(), /stopping/);
+    await assert.rejects(controller.update(), /stopping/);
+    await assert.rejects(controller.setAutomatic(true), /stopping/);
+    await controller.tick(); controller.start();
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(stopped, false, `shutdown must await ${held}`);
+    release();
+    await Promise.all([update, stopping]);
+    assert.equal(stopped, true);
+    assert.equal((await controller.status()).outcome, 'activated');
+    assert.deepEqual(calls, ['check', 'stage', 'activate']);
+  }
+});
+
+test('shutdown joins a held periodic check and prevents its automatic update or timer reschedule', async t => {
+  const callbacks = [], cancelled = [];
+  const { controller, options, calls } = await fixture(t, {
+    schedule: callback => { callbacks.push(callback); return callbacks.length; }, cancel: timer => { cancelled.push(timer); },
+  });
+  await controller.setAutomatic(true);
+  let release, entered;
+  const gate = new Promise(resolve => { release = resolve; });
+  const started = new Promise(resolve => { entered = resolve; });
+  options.consumer.check = async () => { calls.push('check'); entered(); await gate; return selected(); };
+  controller.start();
+  const scheduled = callbacks[0]();
+  await started;
+  let stopped = false;
+  const stopping = controller.stop().then(() => { stopped = true; });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(stopped, false);
+  release(); await Promise.all([scheduled, stopping]);
+  assert.deepEqual(calls, ['check']);
+  assert.deepEqual(cancelled, [1]);
+  assert.equal(callbacks.length, 1);
+  assert.equal((await controller.status()).outcome, 'available');
+  await callbacks[0](); controller.start(); await controller.tick();
+  assert.equal(callbacks.length, 1);
+  assert.deepEqual(calls, ['check']);
+});

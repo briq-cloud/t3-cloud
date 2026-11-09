@@ -119,6 +119,10 @@ export class RuntimeUpdates {
     this.consumer = consumer ?? runtimeReleaseConsumer({ state, stage });
     this.file = join(state, 'updates', 'preferences.json');
     this.busy = false;
+    this.stopped = false;
+    this.operation = null;
+    this.activeTick = null;
+    this.stopPromise = null;
     this.liveDrain = null;
     this.record = { protocol: 1, automatic: false, checkedAt: null, available: null, outcome: 'unchecked', attempted: null, staged: null };
   }
@@ -147,11 +151,17 @@ export class RuntimeUpdates {
   }
   async save(patch) { const next = { ...this.record, ...patch }; await durableJson(this.file, next); this.record = next; }
   async exclusive(work) {
+    if (this.stopped) throw Error('Runtime updates are stopping');
     if (this.busy) return { ...(await this.status()), busy: true };
     this.busy = true;
-    try { await work(); } catch { await this.save({ outcome: 'failed' }); }
-    finally { this.busy = false; }
-    return this.status();
+    const operation = Promise.resolve().then(async () => {
+      try { await work(); } catch { await this.save({ outcome: 'failed' }); }
+      finally { this.busy = false; }
+      return this.status();
+    });
+    this.operation = operation;
+    try { return await operation; }
+    finally { if (this.operation === operation) this.operation = null; }
   }
   async status() {
     const runtime = await this.getRuntime();
@@ -196,9 +206,17 @@ export class RuntimeUpdates {
     else if (result.identity === staged.identity) { this.currentSource = available.source; await this.save({ outcome: 'activated' }); }
     else throw Error('Activation outcome unknown');
   }
-  async tick() {
-    if (this.busy) return;
+  tick() {
+    if (this.stopped) return Promise.resolve();
+    if (this.activeTick) return this.activeTick;
+    const tick = Promise.resolve().then(() => this.runTick());
+    this.activeTick = tick;
+    return tick.finally(() => { if (this.activeTick === tick) this.activeTick = null; });
+  }
+  async runTick() {
+    if (this.stopped || this.busy) return;
     const runtime = await this.getRuntime();
+    if (this.stopped) return;
     // A live drain has a single durable handle; complete it without replaying activation.
     if (runtime.phase === 'draining' && runtime.desired && this.liveDrain === runtime.desired) {
       return this.exclusive(async () => {
@@ -215,16 +233,26 @@ export class RuntimeUpdates {
     }
     if (runtime.phase !== 'running' || runtime.desired) return;
     if (this.record.checkedAt === null || this.now() - this.record.checkedAt >= PERIOD) await this.check();
-    if (this.record.automatic && ['available', 'blocked'].includes(this.record.outcome)) await this.exclusive(() => this.apply(true));
+    if (!this.stopped && this.record.automatic && ['available', 'blocked'].includes(this.record.outcome)) await this.exclusive(() => this.apply(true));
   }
   start() {
-    if (this.timer) return;
-    this.stopped = false;
+    if (this.timer || this.stopped) return;
     const run = async () => {
       try { await this.tick(); } catch { /* Persisted status is inspected by the owner. No raw error leaves this process. */ }
       if (!this.stopped) { this.timer = this.schedule(run, 60000); this.timer?.unref?.(); }
     };
     this.timer = this.schedule(run, Math.floor(this.random() * 60000)); this.timer?.unref?.();
   }
-  stop() { this.stopped = true; this.cancel(this.timer); this.timer = null; }
+  stop() {
+    if (this.stopPromise) return this.stopPromise;
+    this.stopped = true;
+    this.cancel(this.timer); this.timer = null;
+    // Fence synchronously, then join the existing work. Neither shutdown nor a
+    // timer callback may replay an operation whose outcome is still unknown.
+    this.stopPromise = Promise.allSettled([this.activeTick, this.operation]).then(results => {
+      const failure = results.find(result => result.status === 'rejected');
+      if (failure) throw failure.reason;
+    });
+    return this.stopPromise;
+  }
 }

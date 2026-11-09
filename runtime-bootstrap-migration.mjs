@@ -88,7 +88,7 @@ export async function prepareBootstrapMigration(env = process.env, { identity = 
   return { id: record.id, revision: record.revision, phase: record.phase };
 }
 export async function recoverBootstrapMigration({ state, env, source, baseImage, supervisor, ownership, input,
-  identity = linuxIdentity, acquireOwnership = acquireRuntimeOwnership }) {
+  identity = linuxIdentity, acquireOwnership = acquireRuntimeOwnership, evidenceFs = { mkdir, open, rename } }) {
   return supervisor.exclusive(async () => {
     let record = await readBootstrapMigration(state);
     if (!record || record.phase === 'completed' || input.action !== 'recover-bootstrap-migration' || input.expectedMigrationId !== record.id ||
@@ -114,17 +114,21 @@ export async function recoverBootstrapMigration({ state, env, source, baseImage,
       await durableJson(fileFor(state), record);
     }
     const evidence = join(state, 'updates/bootstrap-evidence', record.id);
-    await mkdir(evidence, { recursive: true, mode: 0o700 });
+    const syncEvidenceDirectory = async path => {
+      const dir = await evidenceFs.open(path, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+      try { await dir.sync(); } finally { await dir.close(); }
+    };
+    await evidenceFs.mkdir(evidence, { recursive: true, mode: 0o700 });
+    // Persist every new directory entry before removing any original evidence.
+    // Sync existing parents too: a prior attempt may have stopped before fsync.
+    for (const path of [evidence, join(evidence, '..'), join(state, 'updates')]) await syncEvidenceDirectory(path);
     for (const [index, item] of record.legacyEvidence.entries()) {
       const original = join(state, item.path), saved = join(evidence, `${index}.lock`);
       if (item.fingerprint === null) { if (!await absent(original) || !await absent(saved)) throw Error('Unexpected legacy evidence'); continue; }
       if (!await absent(original)) {
         if (!await absent(saved) || await fingerprint(original) !== item.fingerprint) throw Error('Legacy lock evidence changed');
-        await rename(original, saved);
-        for (const path of [join(original, '..'), evidence]) {
-          const dir = await open(path, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
-          try { await dir.sync(); } finally { await dir.close(); }
-        }
+        await evidenceFs.rename(original, saved);
+        for (const path of [join(original, '..'), evidence]) await syncEvidenceDirectory(path);
       }
       if (await fingerprint(saved) !== item.fingerprint) throw Error('Quarantined evidence changed');
     }

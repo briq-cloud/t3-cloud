@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, readFile, writeFile, rm, stat, chmod, readdir } from 'node:fs/promises';
+import { mkdtemp, mkdir, open, readFile, rename, writeFile, rm, stat, chmod, readdir } from 'node:fs/promises';
+import { constants } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { createHash } from 'node:crypto';
@@ -14,10 +15,11 @@ const baseImage = `sha256:${'a'.repeat(64)}`, runtimeIdentity = `sha256:${'b'.re
 const oldImage = `ghcr.io/briq-cloud/t3-cloud@sha256:${'c'.repeat(64)}`;
 const targetImage = `ghcr.io/briq-cloud/t3-cloud@sha256:${'d'.repeat(64)}`;
 const source = 'e'.repeat(40);
-async function fixture(t) {
+async function fixture(t, { loaderEvidence = false } = {}) {
   const state = await mkdtemp(join(tmpdir(), 't3-initial-migration-'));
   const leases = []; t.after(async () => { for (const lease of leases) await lease.close(); await rm(state, { recursive: true, force: true }); });
   await mkdir(join(state, 'central.lock')); await writeFile(join(state, 'central.lock/pid'), 'do not use this persisted PID');
+  if (loaderEvidence) await mkdir(join(state, 'updates/loader.lock'), { recursive: true });
   const env = { T3_CLOUD_STATE: state, T3_CLOUD_OWNER_ID: 'owner', T3_CLOUD_CHILD_IMAGE: oldImage, T3_CLOUD_BOOTSTRAP_BASE_IMAGE: baseImage };
   const manifest = { baseImage, childImage: targetImage, source, files: [{ path: 'opt/t3-cloud/runtime-recovery.json', type: 'file', sha256: createHash('sha256').update('{"protocol":1,"persistedBindings":"quarantine"}\n').digest('hex') }] };
   await prepareBootstrapMigration(env, { identity: async () => ({ ...testIdentity, bootId: oldBoot }), stage: async () => ({ identity: runtimeIdentity, path: '/mock-staged' }), verify: async () => manifest });
@@ -41,6 +43,55 @@ test('explicit changed-boot recovery adopts verified release without activation 
   assert.equal(await readFile(join(f.state, 'updates/bootstrap-evidence', receipt.id, '0.lock/pid'), 'utf8'), 'do not use this persisted PID');
   await assert.rejects(stat(join(f.state, 'central.lock')), { code: 'ENOENT' });
 });
+function observedEvidenceFs(events, failSync = () => false) {
+  return {
+    mkdir: async (...args) => { events.push(['mkdir', args[0]]); return mkdir(...args); },
+    rename: async (...args) => { events.push(['rename', ...args]); return rename(...args); },
+    open: async (path, flags) => {
+      assert.equal(flags, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+      const handle = await open(path, flags);
+      return {
+        sync: async () => { events.push(['sync', path]); if (failSync(path)) throw Error('Injected directory fsync failure'); await handle.sync(); },
+        close: async () => { events.push(['close', path]); await handle.close(); },
+      };
+    },
+  };
+}
+test('quarantine durably publishes its parent chain before either legacy rename and syncs both rename parents', async t => {
+  const f = await fixture(t, { loaderEvidence: true }), events = [];
+  const receipt = await readBootstrapMigration(f.state);
+  const updates = join(f.state, 'updates'), root = join(updates, 'bootstrap-evidence'), evidence = join(root, receipt.id);
+  await recoverBootstrapMigration({ ...f.options, input: await f.input(), evidenceFs: observedEvidenceFs(events) });
+  const synced = path => [['sync', path], ['close', path]];
+  assert.deepEqual(events, [
+    ['mkdir', evidence], ...synced(evidence), ...synced(root), ...synced(updates),
+    ['rename', join(f.state, 'central.lock'), join(evidence, '0.lock')], ...synced(f.state), ...synced(evidence),
+    ['rename', join(updates, 'loader.lock'), join(evidence, '1.lock')], ...synced(updates), ...synced(evidence),
+  ]);
+});
+for (const failedDirectory of ['leaf', 'evidence parent', 'updates parent']) {
+  test(`failure syncing ${failedDirectory} leaves all original evidence and retry syncs existing parents`, async t => {
+    const f = await fixture(t, { loaderEvidence: true }), events = [];
+    const receipt = await readBootstrapMigration(f.state), updates = join(f.state, 'updates');
+    const root = join(updates, 'bootstrap-evidence'), evidence = join(root, receipt.id);
+    const chain = [evidence, root, updates], failedPath = chain[['leaf', 'evidence parent', 'updates parent'].indexOf(failedDirectory)];
+    await assert.rejects(recoverBootstrapMigration({ ...f.options, input: await f.input(), evidenceFs: observedEvidenceFs(events, path => path === failedPath) }), /Injected directory fsync failure/);
+    assert.deepEqual(events.filter(event => event[0] === 'sync').map(event => event[1]), chain.slice(0, chain.indexOf(failedPath) + 1));
+    assert.deepEqual(events.at(-1), ['close', failedPath]);
+    assert.equal(events.some(event => event[0] === 'rename'), false);
+    assert.equal(await readFile(join(f.state, 'central.lock/pid'), 'utf8'), 'do not use this persisted PID');
+    assert.equal((await stat(join(updates, 'loader.lock'))).isDirectory(), true);
+    await assert.rejects(stat(join(evidence, '0.lock')), { code: 'ENOENT' });
+    await assert.rejects(stat(join(evidence, '1.lock')), { code: 'ENOENT' });
+    assert.equal(f.starts.length, 0); assert.equal(f.supervisor.admitting, false);
+    assert.equal((await readBootstrapMigration(f.state)).phase, 'recovering');
+    events.length = 0; f.setBoot('33333333-3333-3333-3333-333333333333');
+    await recoverBootstrapMigration({ ...f.options, input: await f.input(), evidenceFs: observedEvidenceFs(events) });
+    assert.deepEqual(events.filter(event => event[0] === 'sync').slice(0, 3).map(event => event[1]), chain);
+    assert.ok(events.findIndex(event => event[0] === 'rename') > events.findIndex(event => event[0] === 'close' && event[1] === updates));
+    assert.equal((await readBootstrapMigration(f.state)).phase, 'completed');
+  });
+}
 for (const failure of ['same boot', 'copied binding', 'changed image', 'changed artifact', 'legacy tamper', 'stale CAS', 'contradictory journal']) {
   test(`${failure} keeps bootstrap recovery closed without starting native work`, async t => {
     const f = await fixture(t); const input = await f.input();

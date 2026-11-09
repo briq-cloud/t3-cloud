@@ -249,6 +249,7 @@ jobs:
           node bin/package-runtime-release.mjs "$root" "$RUNNER_TEMP/runtime-release" "${BASE##*@}" "$SOURCE" "$T3_IMAGE@$DIGEST"
           node bin/check-runtime-release.mjs "$RUNNER_TEMP/runtime-release"
       - name: Attest exact runtime assets
+        id: runtime-attestation
         uses: actions/attest-build-provenance@v2
         with:
           subject-path: |
@@ -259,11 +260,14 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SOURCE: ${{ github.sha }}
           TAG: ${{ needs.image.outputs.tag }}
+          ATTESTATION_BUNDLE: ${{ steps.runtime-attestation.outputs.bundle-path }}
         run: |
           set -euo pipefail
+          node --input-type=module -e 'import { copyFile, stat } from "node:fs/promises"; import { join } from "node:path"; const source = process.env.ATTESTATION_BUNDLE; const info = await stat(source); if (!info.isFile() || info.size <= 0 || info.size > 16000000) throw Error("Invalid attestation bundle"); await copyFile(source, join(process.env.RUNNER_TEMP, "runtime-release/runtime-attestation.jsonl"));'
           # A source-addressed tag prevents accidental replacement; no --clobber.
           gh release create "runtime-$SOURCE" \
             "$RUNNER_TEMP/runtime-release/manifest.json" \
             "$RUNNER_TEMP/runtime-release/runtime-blobs.tar" \
+            "$RUNNER_TEMP/runtime-release/runtime-attestation.jsonl" \
             --repo briq-cloud/t3-cloud --target "$SOURCE" \
             --title "Runtime $TAG" --notes "Complete linux/amd64 application runtime. Verify artifact provenance before installation." --latest=false

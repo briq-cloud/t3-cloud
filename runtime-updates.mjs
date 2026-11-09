@@ -2,7 +2,7 @@ import { constants } from 'node:fs';
 import { mkdir, mkdtemp, open, rm } from 'node:fs/promises';
 import { isAbsolute, join } from 'node:path';
 import { durableJson } from './runtime-supervisor.mjs';
-import { verifyManifestAttestation } from './runtime-bundle.mjs';
+import { verifyManifestAttestation, RUNTIME_ATTESTATION_ASSET, MAX_RUNTIME_ATTESTATION_BYTES } from './runtime-bundle.mjs';
 import { MAX_RUNTIME_ARCHIVE_BYTES, verifyAndUnpackRuntimeArchive } from './bin/runtime-archive.mjs';
 
 const API = 'https://api.github.com/repos/briq-cloud/t3-cloud/releases?per_page=10';
@@ -18,7 +18,7 @@ export function selectRuntimeRelease(rows) {
     .map(row => {
       if (!Number.isFinite(Date.parse(row.published_at)) || !Array.isArray(row.assets) || row.assets.length > 32) throw Error('Invalid runtime release');
       const sizes = {};
-      for (const [name, limit] of [['manifest.json', MANIFEST_LIMIT], ['runtime-blobs.tar', MAX_RUNTIME_ARCHIVE_BYTES]]) {
+      for (const [name, limit] of [[RUNTIME_ATTESTATION_ASSET, MAX_RUNTIME_ATTESTATION_BYTES], ['manifest.json', MANIFEST_LIMIT], ['runtime-blobs.tar', MAX_RUNTIME_ARCHIVE_BYTES]]) {
         const assets = row.assets.filter(asset => asset.name === name);
         if (assets.length !== 1 || !Number.isSafeInteger(assets[0].size) || assets[0].size <= 0 || assets[0].size > limit || assets[0].state !== 'uploaded') throw Error('Incomplete runtime release');
         sizes[name] = assets[0].size;
@@ -38,7 +38,7 @@ function safeTransportUrl(url, initial, asset) {
 // Public GitHub reads only. No owner, vendor or platform credentials enter fetch.
 export async function readReleaseAsset(url, { limit, expectedSize, file, fetch: fetcher = globalThis.fetch, timeout = 30000 } = {}) {
   const initial = new URL(url);
-  const asset = initial.origin === 'https://github.com' && /^\/briq-cloud\/t3-cloud\/releases\/download\/runtime-[a-f0-9]{40}\/(manifest\.json|runtime-blobs\.tar)$/.test(initial.pathname) && !initial.search;
+  const asset = initial.origin === 'https://github.com' && /^\/briq-cloud\/t3-cloud\/releases\/download\/runtime-[a-f0-9]{40}\/(manifest\.json|runtime-blobs\.tar|runtime-attestation\.jsonl)$/.test(initial.pathname) && !initial.search;
   if (!asset && initial.href !== API) throw Error('Unknown release URL');
   if (!Number.isSafeInteger(limit) || limit <= 0 || limit > MAX_RUNTIME_ARCHIVE_BYTES) throw Error('Invalid transfer bound');
   const signal = AbortSignal.timeout(timeout);
@@ -95,7 +95,7 @@ export function runtimeReleaseConsumer({ state, stage, fetch: fetcher = globalTh
       const scratch = await mkdtemp(join(directory, 'download-'));
       try {
         let manifest;
-        for (const [name, limit] of [['manifest.json', MANIFEST_LIMIT], ['runtime-blobs.tar', MAX_RUNTIME_ARCHIVE_BYTES]]) {
+        for (const [name, limit] of [[RUNTIME_ATTESTATION_ASSET, MAX_RUNTIME_ATTESTATION_BYTES], ['manifest.json', MANIFEST_LIMIT], ['runtime-blobs.tar', MAX_RUNTIME_ARCHIVE_BYTES]]) {
           await readReleaseAsset(`https://github.com/briq-cloud/t3-cloud/releases/download/${selected.tag}/${name}`,
             { limit, expectedSize: selected.sizes[name], file: join(scratch, name), fetch: fetcher, timeout: name.endsWith('.tar') ? 300000 : 30000 });
           if (name === 'manifest.json') {

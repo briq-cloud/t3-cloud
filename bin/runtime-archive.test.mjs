@@ -23,6 +23,7 @@ async function fixture(t) {
   await mkdir(join(bundle, 'blobs'), { recursive: true });
   await writeFile(join(bundle, 'manifest.json'), JSON.stringify(manifest()));
   await writeFile(join(bundle, 'blobs', hash), contents);
+  await writeFile(join(root, 'runtime-attestation.jsonl'), 'untrusted evidence fixture');
   const archive = join(root, 'runtime-blobs.tar');
   await packRuntimeArchive(bundle, archive);
   return { root, bundle, archive, output: join(root, 'extracted') };
@@ -84,7 +85,11 @@ test('rejects unexpected source blobs and symlinked archive paths', async t => {
 
 test('real verifier failure prevents extraction; invocation pins source and identity', async t => {
   const f = await fixture(t);
-  await assert.rejects(verifyAndUnpackRuntimeArchive(f.archive, f.output, manifest(), { run: async (cli, args) => {
+  await assert.rejects(verifyAndUnpackRuntimeArchive(f.archive, f.output, manifest(), { run: async (cli, args, options) => {
+    assert.equal(await readFile(args[args.indexOf('--bundle') + 1], 'utf8'), 'untrusted evidence fixture');
+    assert.equal(options.env.HOME, '/nonexistent');
+    assert.equal(options.env.GH_CONFIG_DIR, '/nonexistent');
+    assert.equal(options.env.GH_TOKEN, undefined);
     assert.equal(cli, 'gh');
     assert.deepEqual(args.slice(0, 2), ['attestation', 'verify']);
     assert.notEqual(args[2], f.archive);

@@ -7,6 +7,7 @@ import { RuntimeUpdates, readReleaseAsset, runtimeReleaseConsumer, selectRuntime
 
 const source = 'a'.repeat(40), currentSource = 'b'.repeat(40), digest = `sha256:${'c'.repeat(64)}`;
 const release = () => ({ tag_name: `runtime-${source}`, draft: false, prerelease: false, published_at: '2026-11-09T00:00:00Z', assets: [
+  { name: 'runtime-attestation.jsonl', size: 2, state: 'uploaded' },
   { name: 'manifest.json', size: 2, state: 'uploaded' }, { name: 'runtime-blobs.tar', size: 1024, state: 'uploaded' },
 ] });
 const selected = () => selectRuntimeRelease([release()]);
@@ -31,6 +32,8 @@ test('release selection pins canonical source and rejects oversized or duplicate
   assert.equal(selectRuntimeRelease([{ ...row, tag_name: '../bad' }]), null);
   assert.equal(selectRuntimeRelease([{ ...row, prerelease: true }]), null);
   assert.throws(() => selectRuntimeRelease([{ ...row, assets: [...row.assets, row.assets[0]] }]));
+  assert.throws(() => selectRuntimeRelease([{ ...row, assets: row.assets.filter(a => !a.name.endsWith('.jsonl')) }]));
+  assert.throws(() => selectRuntimeRelease([{ ...row, assets: row.assets.map(a => a.name.endsWith('.jsonl') ? { ...a, size: 16_000_001 } : a) }]));
   assert.throws(() => selectRuntimeRelease([{ ...row, assets: row.assets.map(a => ({ ...a, size: 2_000_000_000 })) }]));
 });
 
@@ -69,19 +72,19 @@ test('consumer pins manifest source before fetching archive and cleans failed do
     fetch: async url => { calls.push(url); return new Response('{}'); },
     verifyManifest: async () => ({ manifest: { source: currentSource } }), verifyArchive: async () => { calls.push('archive'); } });
   await assert.rejects(consumer.stage(selected()));
-  assert.deepEqual(calls, [asset('manifest.json')]);
+  assert.deepEqual(calls, [asset('runtime-attestation.jsonl'), asset('manifest.json')]);
   assert.deepEqual((await readdir(join(state, 'updates'))).filter(name => name.startsWith('download-')), []);
 });
 
 test('consumer verifies both assets before passing private paths to supervisor stage', async t => {
   const { state } = await fixture(t), order = [];
   const consumer = runtimeReleaseConsumer({ state,
-    fetch: async url => { order.push(url.endsWith('.tar') ? 'download-archive' : 'download-manifest'); return new Response(url.endsWith('.tar') ? Buffer.alloc(1024) : '{}'); },
-    verifyManifest: async file => { assert.equal((await stat(file)).mode & 0o777, 0o600); order.push('manifest-proof'); return { manifest: { source } }; },
+    fetch: async url => { order.push(url.endsWith('.tar') ? 'download-archive' : url.endsWith('.jsonl') ? 'download-evidence' : 'download-manifest'); return new Response(url.endsWith('.tar') ? Buffer.alloc(1024) : '{}'); },
+    verifyManifest: async file => { assert.equal(await readFile(join(file, '..', 'runtime-attestation.jsonl'), 'utf8'), '{}'); assert.equal((await stat(file)).mode & 0o777, 0o600); order.push('manifest-proof'); return { manifest: { source } }; },
     verifyArchive: async (_archive, _output, manifest) => { assert.equal(manifest.source, source); order.push('archive-proof'); },
     stage: async (file, blobs) => { assert.ok(file.startsWith(join(state, 'updates', 'download-'))); assert.equal(blobs, join(file, '..', 'blobs')); order.push('stage'); return { identity: digest }; } });
   assert.deepEqual(await consumer.stage(selected()), { identity: digest });
-  assert.deepEqual(order, ['download-manifest', 'manifest-proof', 'download-archive', 'archive-proof', 'stage']);
+  assert.deepEqual(order, ['download-evidence', 'download-manifest', 'manifest-proof', 'download-archive', 'archive-proof', 'stage']);
 });
 
 test('preferences default off and persist with private permissions across restart', async t => {

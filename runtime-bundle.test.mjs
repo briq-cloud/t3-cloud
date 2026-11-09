@@ -19,7 +19,15 @@ const contents = Buffer.from('release test bytes');
 const fileHash = createHash('sha256').update(contents).digest('hex');
 const certificate = { sourceRepositoryIdentifier: '1450999885', sourceRepositoryRef: 'refs/heads/main', sourceRepository: 'briq-cloud/t3-cloud' };
 const verified = value => ({ stdout: JSON.stringify([{ verificationResult: { signature: { certificate: value } } }]) });
-const run = async (_cli, args) => {
+const run = async (_cli, args, options) => {
+  const bundle = args[args.indexOf('--bundle') + 1];
+  assert.equal(await readFile(bundle, 'utf8'), 'untrusted evidence fixture');
+  assert.equal((await lstat(bundle)).mode & 0o777, 0o400);
+  assert.equal(options.env.HOME, '/nonexistent');
+  assert.equal(options.env.GH_CONFIG_DIR, '/nonexistent');
+  assert.equal(options.env.GH_TOKEN, undefined);
+  assert.ok(options.env.XDG_CACHE_HOME.startsWith(dirname(bundle)));
+  assert.equal(args.includes('--custom-trusted-root'), false);
   assert.equal(args[0], 'attestation');
   assert.equal(args[1], 'verify');
   assert.ok(args.includes('briq-cloud/t3-cloud/.github/workflows/image.yml'));
@@ -39,6 +47,7 @@ function fixture() {
 test('attested complete release stages exact bytes under immutable digest', async t => {
   const root = await mkdtemp(join(tmpdir(), 't3-release-'));
   t.after(() => cleanup(root));
+  await writeFile(join(root, 'runtime-attestation.jsonl'), 'untrusted evidence fixture');
   const blobs = join(root, 'blobs'), releases = join(root, 'releases'), manifestFile = join(root, 'manifest.json');
   await mkdir(blobs);
   await writeFile(join(blobs, fileHash), contents);
@@ -52,6 +61,7 @@ test('attested complete release stages exact bytes under immutable digest', asyn
 test('wrong repository identity and failed attestation fail closed', async t => {
   const root = await mkdtemp(join(tmpdir(), 't3-release-'));
   t.after(() => cleanup(root));
+  await writeFile(join(root, 'runtime-attestation.jsonl'), 'untrusted evidence fixture');
   const file = join(root, 'manifest.json');
   await writeFile(file, JSON.stringify(fixture()));
   await assert.rejects(verifyManifestAttestation(file, { run: async () => verified({ ...certificate, sourceRepositoryIdentifier: '1' }) }), /provenance/);
@@ -68,6 +78,7 @@ test('incomplete inventory and unsafe paths fail validation', () => {
 test('bad blob never creates a visible release', async t => {
   const root = await mkdtemp(join(tmpdir(), 't3-release-'));
   t.after(() => cleanup(root));
+  await writeFile(join(root, 'runtime-attestation.jsonl'), 'untrusted evidence fixture');
   const blobs = join(root, 'blobs'), releases = join(root, 'releases'), manifestFile = join(root, 'manifest.json');
   await mkdir(blobs);
   await writeFile(join(blobs, fileHash), 'wrong bytes');
@@ -79,6 +90,7 @@ test('bad blob never creates a visible release', async t => {
 test('image inventory packs only declared application roots', async t => {
   const root = await mkdtemp(join(tmpdir(), 't3-image-'));
   t.after(() => cleanup(root));
+  await writeFile(join(root, 'runtime-attestation.jsonl'), 'untrusted evidence fixture');
   for (const path of REQUIRED_BUNDLE_PATHS) {
     await mkdir(dirname(join(root, path)), { recursive: true });
     await writeFile(join(root, path), contents, { mode: 0o700 });
@@ -115,11 +127,16 @@ test('logical required SDK path resolves pnpm links while chained escapes and cy
 
 test('attestation consumes captured private bytes even when original input changes', async t => {
   const root = await mkdtemp(join(tmpdir(), 't3-captured-')); t.after(() => cleanup(root));
+  await writeFile(join(root, 'runtime-attestation.jsonl'), 'untrusted evidence fixture');
   const file = join(root, 'manifest.json'), original = JSON.stringify(fixture());
   await writeFile(file, original);
   const result = await verifyManifestAttestation(file, { run: async (_cli, args) => {
     assert.notEqual(args[2], file);
     assert.equal(await readFile(args[2], 'utf8'), original);
+    const captured = args[args.indexOf('--bundle') + 1];
+    assert.notEqual(captured, join(root, 'runtime-attestation.jsonl'));
+    await writeFile(join(root, 'runtime-attestation.jsonl'), 'changed');
+    assert.equal(await readFile(captured, 'utf8'), 'untrusted evidence fixture');
     await writeFile(file, '{}');
     return verified(certificate);
   } });
@@ -128,6 +145,7 @@ test('attestation consumes captured private bytes even when original input chang
 
 test('sealed staging persists manifest and cold verification rejects tampering and base mismatch', async t => {
   const root = await mkdtemp(join(tmpdir(), 't3-cold-')); t.after(() => cleanup(root));
+  await writeFile(join(root, 'runtime-attestation.jsonl'), 'untrusted evidence fixture');
   const blobs = join(root, 'blobs'), file = join(root, 'manifest.json'); await mkdir(blobs);
   await writeFile(join(blobs, fileHash), contents); await writeFile(file, JSON.stringify(fixture()));
   const staged = await stageBundle(file, blobs, join(root, 'releases'), { run });
@@ -136,4 +154,18 @@ test('sealed staging persists manifest and cold verification rejects tampering a
   await assert.rejects(verifyInstalledBundle(staged.path, staged.identity, `sha256:${'e'.repeat(64)}`), /base OS/);
   const target = join(staged.path, 'opt/t3/node'); await chmod(target, 0o700); await writeFile(target, 'tampered'); await chmod(target, 0o500);
   await assert.rejects(verifyInstalledBundle(staged.path, staged.identity, fixture().baseImage), /digest/);
+});
+
+test('missing, oversized and symlinked attestation evidence fail before invoking gh', async t => {
+  const root = await mkdtemp(join(tmpdir(), 't3-evidence-')); t.after(() => cleanup(root));
+  const file = join(root, 'manifest.json'), bundleFile = join(root, 'runtime-attestation.jsonl');
+  await writeFile(file, JSON.stringify(fixture()));
+  let calls = 0;
+  const options = { run: async () => { calls++; return verified(certificate); } };
+  await assert.rejects(verifyManifestAttestation(file, options), { code: 'ENOENT' });
+  await writeFile(bundleFile, Buffer.alloc(16_000_001));
+  await assert.rejects(verifyManifestAttestation(file, options), /attestation size/);
+  await rm(bundleFile); await symlink(file, bundleFile);
+  await assert.rejects(verifyManifestAttestation(file, options));
+  assert.equal(calls, 0);
 });

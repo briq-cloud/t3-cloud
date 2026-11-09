@@ -20,6 +20,7 @@ export const REQUIRED_BUNDLE_PATHS = Object.freeze([
   'opt/t3/t3', 'opt/t3/node', 'opt/t3/source.json', 'opt/t3/resource-monitor',
   'opt/t3/dist/bin.mjs', 'opt/t3/node_modules/@anthropic-ai/claude-agent-sdk/manifest.json',
   'opt/t3-cloud/manager-main.mjs', 'opt/t3-cloud/prepare.mjs',
+  'opt/t3-cloud/runtime-controller.mjs', 'opt/t3-cloud/runtime-controller-process.mjs', 'opt/t3-cloud/runtime-updates.mjs',
   'opt/t3-cloud/bin/release-shims/node', 'opt/t3-cloud/bin/release-shims/briq',
   'opt/t3-cloud/bin/release-shims/claude', 'opt/t3-cloud/bin/release-shims/codex',
   'opt/t3-cloud/node_modules/ws/package.json', 'opt/codex/bin/codex',
@@ -143,7 +144,42 @@ export function validateManifest(manifest) {
   return `sha256:${digest(Buffer.from(JSON.stringify(manifest)))}`;
 }
 
-export async function verifyManifestAttestation(manifestFile, { run = promisify(execFile), cli = 'gh' } = {}) {
+export const RUNTIME_ATTESTATION_ASSET = 'runtime-attestation.jsonl';
+export const MAX_RUNTIME_ATTESTATION_BYTES = 16_000_000;
+
+// Capture bounded, ordinary bytes before invoking gh. The release supplies
+// evidence, never a trust root; gh bootstraps its standard authenticated TUF roots.
+export async function snapshotAttestation(bundleFile, scratch) {
+  if (!isAbsolute(bundleFile)) throw Error('Absolute attestation path required');
+  const input = await open(bundleFile, constants.O_RDONLY | constants.O_NOFOLLOW);
+  let bytes;
+  try {
+    const info = await input.stat();
+    if (!info.isFile() || info.nlink !== 1 || info.size <= 0 || info.size > MAX_RUNTIME_ATTESTATION_BYTES) throw Error('Invalid attestation size');
+    bytes = Buffer.alloc(info.size + 1);
+    let size = 0;
+    while (size < bytes.length) {
+      const result = await input.read(bytes, size, bytes.length - size, size);
+      if (!result.bytesRead) break;
+      size += result.bytesRead;
+    }
+    if (size !== info.size) throw Error('Attestation changed during capture');
+    bytes = bytes.subarray(0, size);
+  } finally { await input.close(); }
+  const snapshot = join(scratch, RUNTIME_ATTESTATION_ASSET);
+  await writeFile(snapshot, bytes, { flag: 'wx', mode: 0o400 });
+  return snapshot;
+}
+
+export function attestationEnvironment(scratch) {
+  // Do not consult owner login state, even when verification is run manually.
+  const env = { ...process.env, HOME: '/nonexistent', GH_CONFIG_DIR: '/nonexistent',
+    XDG_CACHE_HOME: join(scratch, 'cache'), GH_HOST: 'github.com', GH_PROMPT_DISABLED: '1' };
+  for (const key of ['GH_TOKEN', 'GITHUB_TOKEN', 'GH_ENTERPRISE_TOKEN', 'GITHUB_ENTERPRISE_TOKEN']) delete env[key];
+  return env;
+}
+
+export async function verifyManifestAttestation(manifestFile, { run = promisify(execFile), cli = 'gh', bundleFile = join(dirname(manifestFile), RUNTIME_ATTESTATION_ASSET) } = {}) {
   if (!isAbsolute(manifestFile)) throw Error('Absolute manifest path required');
   const bytes = await readFile(manifestFile);
   if (bytes.length > 16_000_000) throw Error('Release manifest exceeds capacity limit');
@@ -151,12 +187,13 @@ export async function verifyManifestAttestation(manifestFile, { run = promisify(
   const identity = validateManifest(manifest);
   const snapshot = await mkdtemp(join(tmpdir(), 't3-attestation-'));
   try {
+  const bundleSnapshot = await snapshotAttestation(bundleFile, snapshot);
   const snapshotFile = join(snapshot, 'manifest.json');
   await writeFile(snapshotFile, bytes, { flag: 'wx', mode: 0o400 });
-  const { stdout } = await run(cli, ['attestation', 'verify', snapshotFile,
+  const { stdout } = await run(cli, ['attestation', 'verify', snapshotFile, '--bundle', bundleSnapshot,
     '-R', 'briq-cloud/t3-cloud', '--signer-workflow', 'briq-cloud/t3-cloud/.github/workflows/image.yml',
     '--source-ref', 'refs/heads/main', '--source-digest', manifest.source, '--format', 'json'],
-    { timeout: 30000, maxBuffer: 1_000_000 });
+    { timeout: 30000, maxBuffer: 1_000_000, env: attestationEnvironment(snapshot) });
   if (!bytes.equals(await readFile(snapshotFile))) throw Error('Release manifest changed during verification');
   const rows = JSON.parse(stdout);
   if (!Array.isArray(rows) || !rows.some(row => {

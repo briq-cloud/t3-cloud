@@ -3,9 +3,9 @@ import { copyFile, lstat, mkdir, mkdtemp, open, readFile, readdir, rm, writeFile
 import { createHash } from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { join, isAbsolute } from 'node:path';
+import { dirname, join, isAbsolute } from 'node:path';
 import { tmpdir } from 'node:os';
-import { validateManifest } from '../runtime-bundle.mjs';
+import { validateManifest, RUNTIME_ATTESTATION_ASSET, snapshotAttestation, attestationEnvironment } from '../runtime-bundle.mjs';
 
 const runFile = promisify(execFile);
 // Keep one downloadable release asset below GitHub's 2 GiB asset limit.
@@ -121,19 +121,20 @@ export async function unpackRuntimeArchive(archive, output, manifest) {
 
 // Verify a private copy and consume that copy. The manifest authenticates every
 // extracted byte as well; neither transport URLs nor release tags are authorities.
-export async function verifyAndUnpackRuntimeArchive(archive, output, manifest, { run = runFile, cli = 'gh' } = {}) {
+export async function verifyAndUnpackRuntimeArchive(archive, output, manifest, { run = runFile, cli = 'gh', bundleFile = join(dirname(archive), RUNTIME_ATTESTATION_ASSET) } = {}) {
   expectedBlobs(manifest);
   if (!isAbsolute(archive)) throw Error('Absolute release path required');
   const info = await lstat(archive);
   if (!info.isFile() || info.nlink !== 1 || info.size > MAX_RUNTIME_ARCHIVE_BYTES) throw Error('Invalid release archive size');
   const scratch = await mkdtemp(join(tmpdir(), 't3-archive-verify-'));
   try {
+    const bundleSnapshot = await snapshotAttestation(bundleFile, scratch);
     const snapshot = join(scratch, 'runtime-blobs.tar');
     await copyFile(archive, snapshot, constants.COPYFILE_EXCL);
-    const { stdout } = await run(cli, ['attestation', 'verify', snapshot, '-R', 'briq-cloud/t3-cloud',
+    const { stdout } = await run(cli, ['attestation', 'verify', snapshot, '--bundle', bundleSnapshot, '-R', 'briq-cloud/t3-cloud',
       '--signer-workflow', 'briq-cloud/t3-cloud/.github/workflows/image.yml',
       '--source-ref', 'refs/heads/main', '--source-digest', manifest.source, '--format', 'json'],
-    { timeout: 30000, maxBuffer: 1_000_000 });
+    { timeout: 30000, maxBuffer: 1_000_000, env: attestationEnvironment(scratch) });
     const rows = JSON.parse(stdout);
     if (!Array.isArray(rows) || !rows.some(row => {
       const certificate = row?.verificationResult?.signature?.certificate;

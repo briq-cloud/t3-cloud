@@ -6,6 +6,7 @@ import { readFile, mkdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import { RuntimeSupervisor } from './runtime-supervisor.mjs';
 import { runtimeProcess } from './runtime-process.mjs';
+import { runtimeControllerProcess } from './runtime-controller-process.mjs';
 import { acquireRuntimeOwnership } from './runtime-ownership.mjs';
 
 export function loaderFrontdoor({ port, host, target, admitting, managing = () => false }) {
@@ -16,7 +17,7 @@ export function loaderFrontdoor({ port, host, target, admitting, managing = () =
     if (!admitting() && !(management && managing())) { res.writeHead(503, { 'cache-control': 'no-store', connection: 'close' }); return res.end(); }
     // Preserve the original Host/Origin/cookies. Existing manager/frontdoor
     // authorization and WebSocket validation run behind this byte-forwarder.
-    const upstream = request({ hostname: '127.0.0.1', port: typeof target === 'function' ? target() : target, path: req.url, method: req.method, headers: req.headers }, response => {
+    const upstream = request({ agent: false, hostname: '127.0.0.1', port: typeof target === 'function' ? target() : target, path: req.url, method: req.method, headers: req.headers }, response => {
       res.writeHead(response.statusCode, response.headers); response.pipe(res);
     });
     upstream.on('error', () => { if (!res.headersSent) res.writeHead(502); res.end(); });
@@ -44,7 +45,7 @@ export async function startLoader(env = process.env, {
   environmentBinding = env.T3_CLOUD_OWNER_ID, acquireOwnership = acquireRuntimeOwnership,
   baseImageFile = '/etc/t3-cloud/base-image', sourceFile = '/etc/t3-cloud/source',
   createDriver = runtimeProcess, createSupervisor = options => new RuntimeSupervisor(options),
-  createUpdates = async options => new (await import('/opt/t3-cloud/runtime-updates.mjs')).RuntimeUpdates(options),
+  createUpdates = options => runtimeControllerProcess(options),
   createRecoveryManager = async options => (await import('/opt/t3-cloud/manager.mjs')).createCloudManager(options),
 } = {}) {
   const state = env.T3_CLOUD_STATE;
@@ -54,8 +55,42 @@ export async function startLoader(env = process.env, {
   const ownership = await acquireOwnership({ directory: join(state, 'updates'), name: 'loader', environmentBinding, legacy: join(state, 'updates', 'loader.lock') });
   const driver = createDriver(env);
   const supervisor = createSupervisor({ state, baseImage, driver });
-  let updates, recoveryServer, closing, updateScheduled = false;
+  let updates, recoveryServer, closing, controllerIdentity, controllerRecovery, controllerFault = false, bootstrapSource = null, transition, updateScheduled = false;
+  const createController = async recovery => {
+    const current = supervisor.journal.current;
+    const selected = !recovery && current !== 'bootstrap' ? await supervisor.verifyRelease(current) : null;
+    const currentSource = selected?.source ?? (current === 'bootstrap' ? bootstrapSource : null);
+    if (currentSource !== null && !/^[a-f0-9]{40}$/.test(currentSource)) throw Error('Pinned bootstrap source required');
+    const controller = await createUpdates({ root: recovery ? '/' : supervisor.releaseRoot(current), state, currentSource, recovery, env,
+      status: async () => supervisor.journal, activity: () => driver.activity(),
+      stage: (file, blobs) => supervisor.stageRelease(file, blobs), activate: () => supervisor.activate(),
+      completeDrain: () => supervisor.completeDrain(), onTerminal: () => replaceController(false),
+      onFailure: () => { controllerFault = true; supervisor.admitting = false; for (const listener of listeners) listener.fence(); } });
+    try { await controller.initialize(); } catch (error) { try { await controller.stop(); } catch {} throw error; }
+    controllerIdentity = current; controllerRecovery = recovery;
+    return controller;
+  };
+  const replaceController = (force = false) => {
+    if (closing) return Promise.resolve();
+    if (transition) return transition;
+    const journal = supervisor.journal;
+    if (!force && (controllerIdentity === journal.current || journal.desired || journal.receipt?.status !== 'committed' || journal.receipt.to !== journal.current)) return Promise.resolve();
+    // The child has sent its terminal response. Join its owned process before
+    // reading preferences or allowing the next release's scheduler to run.
+    transition = (async () => {
+      await updates.stop();
+      if (closing) return;
+      updates = await createController(false);
+      await updates.start();
+    })().catch(async error => {
+      supervisor.admitting = false;
+      await supervisor.save({ phase: 'recovery-required' });
+      throw error;
+    }).finally(() => { transition = null; });
+    return transition;
+  };
   const operations = async (method, enabled) => {
+    if (transition) await transition;
     if (!updates || closing) throw Error('Runtime updater unavailable');
     if (method === 'status') return { ...await updates.status(), recovery: { ownership: ownership.evidence, ownershipRevision: ownership.revision, journalRevision: supervisor.journal.revision ?? 0, bindingsQuarantined: Boolean(supervisor.journal.recovery), required: Boolean(recoveryServer), available: supervisor.recoverable() } };
     if (method === 'reconcile') {
@@ -65,7 +100,7 @@ export async function startLoader(env = process.env, {
       await supervisor.reconcile(enabled);
       const prior = recoveryServer; recoveryServer = null;
       setImmediate(() => prior.close());
-      updates.start();
+      await replaceController(controllerRecovery);
       return operations('status');
     }
     if (method === 'check') return updates.check();
@@ -85,23 +120,14 @@ export async function startLoader(env = process.env, {
   };
   driver.setUpdates(operations);
   const listeners = [loaderFrontdoor({ port: Number(env.PORT ?? 8080), host: env.T3_HOST ?? '0.0.0.0', target: () => recoveryServer ? 8084 : 8082,
-    admitting: () => supervisor.admitting && driver.alive, managing: () => driver.alive || Boolean(recoveryServer?.listening) })];
+    admitting: () => !controllerFault && supervisor.admitting && driver.alive, managing: () => driver.alive || Boolean(recoveryServer?.listening) })];
   if ((env.T3_CLOUD_ROLE ?? 'central') === 'central' && env.T3_CLOUD_NATIVE_ORIGIN) listeners.push(loaderFrontdoor({
-    port: 8081, host: env.T3_HOST ?? '0.0.0.0', target: 8083, admitting: () => supervisor.admitting && driver.alive }));
+    port: 8081, host: env.T3_HOST ?? '0.0.0.0', target: 8083, admitting: () => !controllerFault && supervisor.admitting && driver.alive }));
   try {
     for (const listener of listeners) await listener.listen();
     const status = await supervisor.initialize({ ownership });
-    let selected = null;
-    try { if (supervisor.journal.current && supervisor.journal.current !== 'bootstrap') selected = await supervisor.verifyRelease(supervisor.journal.current); }
-    catch (error) { if (!status.recoveryRequired) throw error; }
-    let bootstrapSource = null;
     try { bootstrapSource = (await readFile(sourceFile, 'utf8')).trim(); } catch (error) { if (error.code !== 'ENOENT') throw error; }
-    const currentSource = selected?.source ?? (supervisor.journal.current === 'bootstrap' ? bootstrapSource : null);
-    if (currentSource !== null && !/^[a-f0-9]{40}$/.test(currentSource)) throw Error('Pinned bootstrap source required');
-    updates = await createUpdates({ state, currentSource, status: async () => supervisor.journal,
-      activity: () => driver.activity(), stage: (file, blobs) => supervisor.stageRelease(file, blobs),
-      activate: () => supervisor.activate(), completeDrain: () => supervisor.completeDrain() });
-    await updates.initialize();
+    updates = await createController(Boolean(status.recoveryRequired));
     if (status.recoveryRequired) {
       // Quarantine never starts the central runtime, credentials, native service
       // or terminal. Only the image's owner-authenticated update surface runs.
@@ -110,9 +136,10 @@ export async function startLoader(env = process.env, {
         runtimeUpdates: { status: () => operations('status'), check: () => operations('check'),
           update: () => operations('update'), automatic: enabled => operations('automatic', enabled), reconcile: input => operations('reconcile', input) } });
       await new Promise((resolve, reject) => { recoveryServer.once('error', reject); recoveryServer.listen(8084, '127.0.0.1', resolve); });
-    } else updates.start();
-    return { supervisor, updates, status, close() {
+    } else await updates.start();
+    return { supervisor, get updates() { return updates; }, status, close() {
       return closing ??= (async () => {
+        await transition;
         await updates.stop();
         supervisor.admitting = false;
         for (const listener of listeners) listener.fence();

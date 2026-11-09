@@ -42,7 +42,7 @@ export function serveRuntimeController(channel = process, { createUpdates = opti
           status: () => request('status'), activity: () => request('activity'), stage: (...args) => request('stage', ...args),
           activate: () => request('activate'), completeDrain: () => request('completeDrain') });
         const tick = updates.tick.bind(updates);
-        updates.tick = (...args) => tick(...args).finally(() => send(controllerPacket(session, 'terminal', ++sequence, {})));
+        updates.tick = (...args) => tick(...args).finally(() => setImmediate(() => { if (!closed) send(controllerPacket(session, 'terminal', ++sequence, {})); }));
         // Unknown migrations must still leave a read-only owner inspection surface.
         if (!recovery) await updates.initialize();
         // Read the durable receipt before timers can run. A committed activation

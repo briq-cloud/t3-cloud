@@ -23,10 +23,10 @@ export function controllerStagePaths(state, args) {
 
 // The bootstrap owns these handles; release code can request only this protocol.
 export function runtimeControllerProcess({ root = '/', state, currentSource, recovery = false, status, activity, stage, activate, completeDrain,
-  onTerminal = () => {}, env = process.env, spawnProcess = spawn, timeout = 660000 }) {
+  onTerminal = () => {}, onFailure = () => {}, env = process.env, spawnProcess = spawn, timeout = 660000 }) {
   if (!isAbsolute(root) || !isAbsolute(state)) throw Error('Absolute controller paths required');
   const session = randomUUID(), pending = new Map();
-  let child, sequence = 0, highwater = 0, failed = false, exited = false, inflight = 0, stopPromise;
+  let child, sequence = 0, highwater = 0, failed = false, exited = false, inflight = 0, stopping = false, stopPromise;
   const fail = () => {
     const first = !failed;
     failed = true;
@@ -34,6 +34,7 @@ export function runtimeControllerProcess({ root = '/', state, currentSource, rec
     pending.clear();
     // Only this owned child handle is terminated. Its unknown command is never replayed.
     if (first && child && !exited) { try { child.kill('SIGTERM'); } catch {} }
+    if (first && !stopping) { try { onFailure(); } catch {} }
   };
   const send = value => {
     if (exited || !child.connected) return;
@@ -79,12 +80,13 @@ export function runtimeControllerProcess({ root = '/', state, currentSource, rec
   child.once('exit', () => { exited = true; fail(); }); child.on('error', fail); child.once('disconnect', fail);
   return {
     initialize: () => call('initialize', [{ state, currentSource, recovery, session }]),
-    status: () => call('status'), check: () => call('check'), update: () => call('update'),
+    status: () => call('status'), check: () => call('check'), update: () => call('update'), tick: () => call('tick'),
     setAutomatic: enabled => { if (typeof enabled !== 'boolean') throw Error('Invalid automatic update preference'); return call('automatic', [enabled]); },
     start: () => call('start'),
     stop() {
       return stopPromise ??= (async () => {
         if (exited) return;
+        stopping = true;
         if (failed) throw Error('Runtime controller termination unknown');
         await call('stop');
         if (exited) return;

@@ -84,10 +84,11 @@ test('wrong session and malformed responses fail closed and cannot resolve an un
 
 test('controller exit rejects its exact live command without replay', async () => {
   const child = new FakeChild();
-  const controller = runtimeControllerProcess({ root: '/', state: '/state', spawnProcess: () => child });
+  let failures = 0;
+  const controller = runtimeControllerProcess({ root: '/', state: '/state', spawnProcess: () => child, onFailure: () => { failures++; } });
   const pending = controller.initialize(); child.emit('exit');
   await assert.rejects(pending, /outcome unknown/);
-  assert.equal(child.messages.length, 1);
+  assert.equal(child.messages.length, 1); assert.equal(failures, 1);
 });
 
 test('controller stop joins its active activation and saves terminal preferences before exit', async t => {

@@ -10,6 +10,7 @@ import { acquireRuntimeOwnership } from './runtime-ownership.mjs';
 import { testIdentity, testLock, testOwnership } from './fixtures/runtime-ownership.mjs';
 import { startLoader } from './runtime-loader.mjs';
 import { runtimeProcess } from './runtime-process.mjs';
+import { runtimeControllerProcess } from './runtime-controller-process.mjs';
 import { RuntimeSupervisor } from './runtime-supervisor.mjs';
 import { RuntimeUpdates } from './runtime-updates.mjs';
 import { createCloudManager } from './manager.mjs';
@@ -22,7 +23,7 @@ async function unusedPort() {
   const server = createServer(); server.listen(0, '127.0.0.1'); await once(server, 'listening');
   const port = server.address().port; await new Promise(resolve => server.close(resolve)); return port;
 }
-async function fixture(t, { recovery = false, unknown = false, journal, ownershipEvidence } = {}) {
+async function fixture(t, { recovery = false, unknown = false, journal, ownershipEvidence, releaseController = false } = {}) {
   const state = await mkdtemp(join(tmpdir(), 't3-loader-integration-'));
   let loader;
   t.after(async () => { await loader?.close(); await rm(state, { recursive: true, force: true }); });
@@ -62,7 +63,22 @@ async function fixture(t, { recovery = false, unknown = false, journal, ownershi
     });
     process.once('disconnect', () => process.exit(0));
   `);
-  let starts = 0, updateWork; const recoveries = [];
+  const controllerEntries = {};
+  if (releaseController) for (const version of ['base-controller', 'released-controller']) {
+    const entry = join(state, `${version}.mjs`); controllerEntries[version] = entry;
+    await writeFile(entry, `
+      import { serveRuntimeController } from ${JSON.stringify(new URL('./runtime-controller.mjs', import.meta.url).href)};
+      import { RuntimeUpdates } from ${JSON.stringify(new URL('./runtime-updates.mjs', import.meta.url).href)};
+      serveRuntimeController(process, { createUpdates(options) {
+        const updates = new RuntimeUpdates({ ...options, schedule: () => ({ unref() {} }), cancel() {}, consumer: {
+          check: async () => ({ tag: 'runtime-${source}', source: '${source}', publishedAt: '2026-11-09T00:00:00Z', sizes: { 'manifest.json': 1, 'runtime-blobs.tar': 1 } }),
+          stage: () => options.stage(${JSON.stringify(join(state, 'updates/download-Abc123/manifest.json'))}, ${JSON.stringify(join(state, 'updates/download-Abc123/blobs'))}) } });
+        const status = updates.status.bind(updates);
+        updates.status = async () => ({ ...await status(), controllerVersion: '${version}' });
+        return updates;
+      } });`);
+  }
+  let starts = 0, updateWork, controllerWork; const recoveries = [], controllers = [];
   const port = await unusedPort();
   loader = await startLoader({ PORT: String(port), T3_HOST: '127.0.0.1', T3_CWD: state, T3_CLOUD_STATE: state,
     T3_CLOUD_PUBLIC_ORIGIN: origin, T3_CLOUD_OWNER_KEY: key, T3_CLOUD_OWNER_ID: 'owner' }, {
@@ -72,6 +88,15 @@ async function fixture(t, { recovery = false, unknown = false, journal, ownershi
     } }),
     createSupervisor: options => new RuntimeSupervisor({ ...options, verify: async () => ({ source }), stage: async () => ({ identity }) }),
     createUpdates: options => {
+      if (releaseController) {
+        const controller = runtimeControllerProcess({ ...options,
+          onTerminal: () => (controllerWork = options.onTerminal()),
+          spawnProcess(command, args, settings) {
+            controllers.push({ command, entry: args[0] });
+            return spawn(process.execPath, [controllerEntries[options.root === '/' ? 'base-controller' : 'released-controller']], settings);
+          } });
+        const update = controller.update; controller.update = () => (updateWork = update()); return controller;
+      }
       const updates = new RuntimeUpdates({ ...options, schedule: () => ({ unref() {} }), cancel() {},
       consumer: { check: async () => ({ tag: `runtime-${source}`, source, publishedAt: '2026-11-09T00:00:00Z', sizes: {} }),
         stage: () => options.stage('/bounded/manifest', '/bounded/blobs') } });
@@ -87,7 +112,7 @@ async function fixture(t, { recovery = false, unknown = false, journal, ownershi
     const text = await response.text();
     return { status: response.status, headers: response.headers, text, value: (() => { try { return JSON.parse(text); } catch { return null; } })() };
   };
-  return { state, loader, send, recoveries, starts: () => starts, waitUpdate: async () => { await new Promise(resolve => setImmediate(resolve)); await updateWork; } };
+  return { state, loader, send, recoveries, controllers, waitController: async () => { await new Promise(resolve => setImmediate(resolve)); await controllerWork; }, starts: () => starts, waitUpdate: async () => { await new Promise(resolve => setImmediate(resolve)); await updateWork; } };
 }
 
 test('authenticated owner update crosses real IPC; drain status stays available and committed receipt survives manager replacement', async t => {
@@ -163,4 +188,27 @@ test('same-boot orphan manager on 8082 receives no traffic from the recovery fro
   const status = await f.send('/_cloud/updates/status');
   assert.equal(status.status, 200); assert.equal(status.value.recovery.ownership, 'orphan'); assert.equal(status.value.recovery.available, false);
   assert.equal((await f.send('/native')).status, 503); assert.equal(f.starts(), 0); assert.equal(oldRequests, 0);
+});
+
+
+test('committed activation joins old updater and launches the selected release controller code and Node', async t => {
+  const f = await fixture(t, { releaseController: true });
+  assert.equal((await f.send('/_cloud/updates/status')).value.controllerVersion, 'base-controller');
+  assert.equal((await f.send('/_cloud/updates/check', { method: 'POST' })).value.outcome, 'available');
+  await f.send('/_cloud/updates/update', { method: 'POST' }); await f.waitUpdate();
+  assert.equal(f.loader.supervisor.journal.phase, 'draining');
+  assert.equal(f.controllers.length, 1);
+  const old = f.loader.updates;
+  await old.tick(); await f.waitController();
+  assert.equal(old.alive, false);
+  const selectedRoot = f.loader.supervisor.releaseRoot(identity);
+  assert.deepEqual(f.controllers, [
+    { command: '/opt/t3/node', entry: '/opt/t3-cloud/runtime-controller.mjs' },
+    { command: join(selectedRoot, 'opt/t3/node'), entry: join(selectedRoot, 'opt/t3-cloud/runtime-controller.mjs') },
+  ]);
+  const current = (await f.send('/_cloud/updates/status')).value;
+  assert.equal(current.controllerVersion, 'released-controller');
+  assert.equal(current.currentSource, source);
+  assert.equal(current.receipt.status, 'committed');
+  assert.equal(current.outcome, 'activated');
 });

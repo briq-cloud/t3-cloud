@@ -69,7 +69,7 @@ export async function prepareBootstrapMigration(env = process.env, { identity = 
   await noHistory(state);
   const local = await identity();
   const input = join(state, 'updates/bootstrap-input');
-  const staged = await stage(join(input, 'manifest.json'), join(input, 'blobs'), join(state, 'releases'));
+  const staged = await stage(join(input, 'manifest.json'), join(input, 'blobs'), join(state, 'releases'), { reuseVerifiedExisting: true });
   const manifest = await verify(staged.path, staged.identity, env.T3_CLOUD_BOOTSTRAP_BASE_IMAGE);
   if (manifest.childImage === env.T3_CLOUD_CHILD_IMAGE) throw Error('Replacement image must differ');
   const legacyEvidence = [];

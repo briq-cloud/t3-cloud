@@ -237,7 +237,13 @@ export async function stageBundle(manifestFile, blobs, releases, options) {
   const destination = join(releases, identity.replace(':', '-'));
   await mkdir(releases, { recursive: true, mode: 0o700 });
   const existing = await stat(destination).catch(error => { if (error.code === 'ENOENT') return null; throw error; });
-  if (existing) throw Error('Release already exists');
+  if (existing) {
+    if (!options?.reuseVerifiedExisting) throw Error('Release already exists');
+    // Reusing a preparation interrupted after publication requires both fresh
+    // publisher verification above and a full rehash of that exact inventory.
+    await verifyInstalledBundle(destination, identity, manifest.baseImage);
+    return { identity, path: destination };
+  }
   const temporary = `${destination}.staging-${randomUUID()}`;
   await mkdir(temporary, { mode: 0o700 });
   try {

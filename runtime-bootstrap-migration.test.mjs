@@ -1,10 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, readFile, writeFile, rm, stat } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, writeFile, rm, stat, chmod, readdir } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, dirname } from 'node:path';
 import { createHash } from 'node:crypto';
 import { prepareBootstrapMigration, readBootstrapMigration, recoverBootstrapMigration } from './runtime-bootstrap-migration.mjs';
+import { stageBundle, REQUIRED_BUNDLE_PATHS, validateManifest } from './runtime-bundle.mjs';
 import { RuntimeSupervisor } from './runtime-supervisor.mjs';
 import { acquireRuntimeOwnership } from './runtime-ownership.mjs';
 import { testLock, testIdentity } from './fixtures/runtime-ownership.mjs';
@@ -86,3 +87,92 @@ test('the same operation resumes after an interrupted owned launch only on anoth
   assert.equal(completed.id, before.id); assert.equal(completed.phase, 'completed'); assert.equal(completed.observedColdBootId, '33333333-3333-3333-3333-333333333333');
   assert.equal(f.starts.length, 2); assert.equal(next.admitting, true);
 });
+
+for (const contradiction of ['missing', 'fresh bootstrap', 'wrong migration', 'wrong journal generation', 'wrong installed runtime']) {
+  test(`completed migration with ${contradiction} activation history never starts or invents bootstrap state`, async t => {
+    const f = await fixture(t);
+    await recoverBootstrapMigration({ ...f.options, input: await f.input() });
+    await f.supervisor.shutdown();
+    const receipt = await readBootstrapMigration(f.state);
+    if (contradiction === 'missing') await rm(f.supervisor.file);
+    else {
+      const journal = contradiction === 'fresh bootstrap' ? { protocol: 1, current: 'bootstrap', staged: null, desired: null, phase: 'stopped', receipt: null } : { ...f.supervisor.journal };
+      if (contradiction === 'wrong migration') journal.initialMigration = '44444444-4444-4444-4444-444444444444';
+      if (contradiction === 'wrong journal generation') journal.initialJournalGeneration = '44444444-4444-4444-4444-444444444444';
+      if (contradiction === 'wrong installed runtime') journal.current = `sha256:${'f'.repeat(64)}`;
+      await writeFile(f.supervisor.file, JSON.stringify(journal));
+    }
+    const original = await readFile(f.supervisor.file, 'utf8').catch(error => { if (error.code === 'ENOENT') return null; throw error; });
+    const starts = [];
+    const next = new RuntimeSupervisor({ state: f.state, baseImage, driver: { start: async (...args) => starts.push(args), health: async () => {} }, verify: async () => f.manifest });
+    assert.deepEqual(await next.initialize({ ownership: { evidence: 'cold' }, initialMigrationReceipt: receipt }), { recoveryRequired: true });
+    assert.equal(next.admitting, false); assert.deepEqual(starts, []); assert.equal(next.recoverable(), false);
+    if (original === null) await assert.rejects(readFile(next.file), { code: 'ENOENT' });
+    else assert.equal(await readFile(next.file, 'utf8'), original);
+  });
+}
+test('completed migration with matching stopped history resumes only the installed release in recovery mode', async t => {
+  const f = await fixture(t);
+  await recoverBootstrapMigration({ ...f.options, input: await f.input() }); await f.supervisor.shutdown();
+  const receipt = await readBootstrapMigration(f.state), starts = [];
+  const next = new RuntimeSupervisor({ state: f.state, baseImage, driver: { start: async (...args) => starts.push(args), health: async () => {} }, verify: async () => f.manifest });
+  assert.deepEqual(await next.initialize({ initialMigrationReceipt: receipt }), { recoveryRequired: false });
+  assert.equal(starts.length, 1); assert.equal(starts[0][0], next.releaseRoot(runtimeIdentity)); assert.deepEqual(starts[0][2], { recovery: true });
+});
+
+async function publishedPreparationFixture(t) {
+  const state = await mkdtemp(join(tmpdir(), 't3-prepare-interruption-'));
+  async function writable(path) {
+    await chmod(path, 0o700);
+    for (const entry of await readdir(path, { withFileTypes: true })) if (entry.isDirectory()) await writable(join(path, entry.name));
+  }
+  t.after(async () => { await writable(state); await rm(state, { recursive: true, force: true }); });
+  await mkdir(join(state, 'central.lock'));
+  const input = join(state, 'updates/bootstrap-input'); await mkdir(join(input, 'blobs'), { recursive: true });
+  const bytes = Buffer.from('fixed published runtime fixture'), hash = createHash('sha256').update(bytes).digest('hex');
+  const directories = new Set();
+  for (const path of REQUIRED_BUNDLE_PATHS) for (let parent = dirname(path); parent !== '.'; parent = dirname(parent)) directories.add(parent);
+  const files = [...directories].map(path => ({ path, type: 'directory', mode: 0o700 }));
+  for (const path of REQUIRED_BUNDLE_PATHS) files.push({ path, type: 'file', mode: 0o700, size: bytes.length, sha256: hash });
+  const manifest = { protocol: 1, project: 'briq-cloud/t3-cloud', platform: 'linux/amd64', baseImage, source, childImage: targetImage, files: files.sort((a, b) => a.path.localeCompare(b.path)) };
+  const manifestFile = join(input, 'manifest.json');
+  await writeFile(manifestFile, JSON.stringify(manifest));
+  await writeFile(join(input, 'blobs', hash), bytes);
+  await writeFile(join(input, 'runtime-attestation.jsonl'), 'signed fixture evidence');
+  let verifications = 0, rejectAttestation = false;
+  const run = async () => {
+    verifications++;
+    if (rejectAttestation) throw Error('Publisher verification failed');
+    return { stdout: JSON.stringify([{ verificationResult: { signature: { certificate: { sourceRepositoryIdentifier: '1450999885', sourceRepositoryRef: 'refs/heads/main' } } } }]) };
+  };
+  const options = { identity: async () => ({ ...testIdentity, bootId: oldBoot }),
+    stage: (file, blobs, releases, options) => stageBundle(file, blobs, releases, { ...options, run }) };
+  const env = { T3_CLOUD_STATE: state, T3_CLOUD_OWNER_ID: 'owner', T3_CLOUD_CHILD_IMAGE: oldImage, T3_CLOUD_BOOTSTRAP_BASE_IMAGE: baseImage };
+  const release = join(state, 'releases', validateManifest(manifest).replace(':', '-'));
+  return { state, input, env, options, release, verifications: () => verifications, rejectAttestation: () => { rejectAttestation = true; } };
+}
+test('preparation resumes after durable release publication without a receipt by rechecking attestation and every installed byte', async t => {
+  const f = await publishedPreparationFixture(t);
+  await assert.rejects(prepareBootstrapMigration(f.env, { ...f.options, verify: async () => { throw Error('Interrupted after release publication'); } }), /Interrupted/);
+  assert.equal((await stat(f.release)).isDirectory(), true); assert.equal(await readBootstrapMigration(f.state), null);
+  assert.equal(f.verifications(), 1);
+  const receipt = await prepareBootstrapMigration(f.env, f.options);
+  assert.equal(receipt.phase, 'prepared'); assert.equal(f.verifications(), 2);
+  assert.equal((await readBootstrapMigration(f.state)).runtimeIdentity, `sha256:${f.release.split('sha256-').at(-1)}`);
+});
+for (const contradiction of ['rejected publisher', 'changed installed bytes', 'changed manifest']) {
+  test(`interrupted preparation rejects ${contradiction} without publishing a receipt`, async t => {
+    const f = await publishedPreparationFixture(t);
+    await assert.rejects(prepareBootstrapMigration(f.env, { ...f.options, verify: async () => { throw Error('Interrupted after release publication'); } }), /Interrupted/);
+    if (contradiction === 'rejected publisher') f.rejectAttestation();
+    if (contradiction === 'changed installed bytes') {
+      const file = join(f.release, 'opt/t3/node'); await chmod(file, 0o700); await writeFile(file, 'changed runtime bytes'); await chmod(file, 0o500);
+    }
+    if (contradiction === 'changed manifest') {
+      const file = join(f.release, '.release-manifest.json'); await chmod(file, 0o600);
+      const manifest = JSON.parse(await readFile(file, 'utf8')); manifest.childImage = oldImage; await writeFile(file, JSON.stringify(manifest)); await chmod(file, 0o400);
+    }
+    await assert.rejects(prepareBootstrapMigration(f.env, f.options));
+    assert.equal(await readBootstrapMigration(f.state), null); assert.equal(f.verifications(), 2);
+  });
+}

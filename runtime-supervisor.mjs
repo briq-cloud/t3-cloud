@@ -16,6 +16,13 @@ function validJournal(j) {
       (j.receipt.status === 'committed' && j.receipt.to === j.current && j.desired === null ||
         j.receipt.status === 'pending' && j.receipt.from === j.current && j.receipt.to === j.desired));
 }
+function matchingInitialMigration(j, receipt) {
+  if (!receipt) return !j.initialMigration;
+  if (j.initialMigration !== receipt.id || !/^[a-f0-9-]{36}$/.test(j.initialJournalGeneration ?? '') ||
+      receipt.phase !== 'prepared' && j.initialJournalGeneration !== receipt.journalGeneration) return false;
+  return receipt.phase !== 'completed' || j.initialInstall === receipt.id && j.current !== 'bootstrap' &&
+    j.recovery === 'persisted-bindings-quarantined' && (j.receipt !== null || j.current === receipt.runtimeIdentity);
+}
 export async function durableJson(path, value) {
   const temporary = `${path}.${randomUUID()}`;
   const handle = await open(temporary, 'wx', 0o600);
@@ -56,6 +63,13 @@ export class RuntimeSupervisor {
         this.journal = { protocol: 0, phase: 'unavailable', revision: 0 };
         return { recoveryRequired: true };
       }
+      // A receipt records installation history, not permission to invent a new
+      // bootstrap journal when the durable history disappears. Only preparation
+      // may create the first journal before any migration has run.
+      if (initialMigrationReceipt && initialMigrationReceipt.phase !== 'prepared') {
+        this.journal = { protocol: 0, phase: 'unavailable', revision: 0 };
+        return { recoveryRequired: true };
+      }
       this.journal = { protocol: 1, current: 'bootstrap', staged: null, desired: null, phase: 'stopped', receipt: null };
       if (bootstrapMigration) Object.assign(this.journal, { initialMigration: bootstrapMigration, initialJournalGeneration: randomUUID() });
       await this.save({});
@@ -65,7 +79,8 @@ export class RuntimeSupervisor {
       this.journal = j && typeof j === 'object' ? j : { protocol: 0, phase: 'unavailable', revision: 0 };
       return { recoveryRequired: true };
     }
-    if (bootstrapMigration || j.initialMigration && j.initialMigration !== initialMigrationReceipt) return { recoveryRequired: true };
+    this.initialMigrationHistoryMatches = matchingInitialMigration(j, initialMigrationReceipt);
+    if (bootstrapMigration || !this.initialMigrationHistoryMatches) return { recoveryRequired: true };
     // A loader/manager crash can leave provider outcomes ambiguous even when the
     // selected version did not change. No native session is resumed implicitly.
     if (ownership && !['fresh', 'clean'].includes(ownership.evidence) || j.phase !== 'stopped' || j.desired) return { recoveryRequired: true };
@@ -85,7 +100,7 @@ export class RuntimeSupervisor {
   }
   recoverable() {
     const j = this.journal;
-    return this.ownership?.evidence === 'cold' && validJournal(j) &&
+    return this.initialMigrationHistoryMatches !== false && this.ownership?.evidence === 'cold' && validJournal(j) &&
       (j.current === 'bootstrap' || identity(j.current)) && j.desired === null &&
       ['running', 'stopped'].includes(j.phase) &&
       (j.receipt === null || j.receipt?.status === 'committed' && j.receipt.to === j.current &&

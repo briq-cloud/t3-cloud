@@ -137,7 +137,7 @@ export async function startLoader(env = process.env, {
     port: 8081, host: env.T3_HOST ?? '0.0.0.0', target: 8083, admitting: () => !controllerFault && supervisor.admitting && driver.alive }));
   try {
     for (const listener of listeners) await listener.listen();
-    const status = await supervisor.initialize({ ownership, bootstrapMigration: migrationPending ? migration.id ?? 'invalid' : false, initialMigrationReceipt: migration?.id ?? null });
+    const status = await supervisor.initialize({ ownership, bootstrapMigration: migrationPending ? migration.id ?? 'invalid' : false, initialMigrationReceipt: migration ?? null });
     try { bootstrapSource = (await readFile(sourceFile, 'utf8')).trim(); } catch (error) { if (error.code !== 'ENOENT') throw error; }
     updates = await createController(Boolean(status.recoveryRequired));
     if (status.recoveryRequired) {

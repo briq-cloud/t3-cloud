@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, writeFile, rm, symlink, link, chmod, rename, readFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, writeFile, rm, symlink, link, chmod, rename, readFile, lstat, readdir, readlink } from 'node:fs/promises';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { join, dirname } from 'node:path';
@@ -91,4 +91,62 @@ test('capacity, storage, permission and process categories remain fixed without 
     [Error('Incomplete release: sensitive path'), 'missing-required-entry'],
     [Error('credential=private-value'), 'unknown'],
   ]) assert.equal(packagingFailureCategory(error), expected);
+});
+
+
+test('finished-image normalization breaks only declared hardlinks before the unchanged packaging verifier runs', async t => {
+  const f = await imageFixture(t);
+  const spacedRoot = `${f.root} exported image`; await rename(f.root, spacedRoot); f.root = spacedRoot;
+  const sourceFile = join(f.root, 'opt/t3/node');
+  const sibling = join(f.root, 'opt/t3/node-copy'), crossRoot = join(f.root, 'opt/codex/bin/codex');
+  const symlinkFile = join(f.root, 'opt/t3/node-link');
+  const longName = join(f.root, 'opt/t3', 'x'.repeat(240));
+  await link(sourceFile, sibling); await link(sourceFile, longName); await rm(crossRoot); await link(sourceFile, crossRoot);
+  await symlink('node', symlinkFile);
+  // An excluded path can share the original inode. Assembly must neither copy
+  // that directory nor change its contents, mode, link target or inode.
+  const outside = join(f.root, 'work/preserved-alias'); await mkdir(dirname(outside), { mode: 0o700 }); await link(sourceFile, outside);
+  const outsideBefore = await lstat(outside), before = await lstat(sourceFile), bytes = await readFile(sourceFile);
+  assert.deepEqual(await packageRuntimeRelease({ ...f, output: `${f.output}-raw` }), { stage: 'inventory', category: 'hardlink' });
+  const helper = new URL('./normalize-runtime-image', import.meta.url).pathname;
+  const result = await run('bash', [helper, f.root]);
+  assert.equal(result.stderr, ''); assert.equal(result.stdout, `Runtime image normalized: roots=${BUNDLE_ROOTS.length} hardlinks=0\n`);
+  for (const path of [sourceFile, sibling, crossRoot, longName]) {
+    const after = await lstat(path);
+    assert.equal(after.nlink, 1); assert.equal(after.mode & 0o777, before.mode & 0o777);
+    assert.deepEqual(await readFile(path), bytes);
+  }
+  assert.equal(await readlink(symlinkFile), 'node');
+  assert.equal((await lstat(outside)).ino, outsideBefore.ino); assert.equal((await lstat(outside)).mode, outsideBefore.mode);
+  assert.deepEqual(await readFile(outside), bytes);
+  async function noHardlinks(path) {
+    const info = await lstat(path);
+    if (info.isDirectory()) for (const child of await readdir(path)) await noHardlinks(join(path, child));
+    else if (info.isFile()) assert.equal(info.nlink, 1);
+  }
+  for (const path of BUNDLE_ROOTS) await noHardlinks(join(f.root, path));
+  assert.equal(await packageRuntimeRelease(f), null);
+  await run(process.execPath, [new URL('./check-runtime-release.mjs', import.meta.url).pathname, f.output]);
+  // Repeating assembly is idempotent and does not copy already independent files.
+  const normalizedInode = (await lstat(sourceFile)).ino;
+  await run('bash', [helper, f.root]); assert.equal((await lstat(sourceFile)).ino, normalizedInode);
+});
+
+test('image normalization never follows a directory symlink or changes excluded data', async t => {
+  const f = await imageFixture(t), outsideDirectory = join(f.root, 'work/data'); await mkdir(outsideDirectory, { recursive: true });
+  const outside = join(outsideDirectory, 'independent'), alias = join(outsideDirectory, 'alias');
+  await writeFile(outside, 'excluded image fixture', { mode: 0o600 }); await link(outside, alias);
+  await symlink('../../work/data', join(f.root, 'opt/t3/excluded-link'));
+  const before = await lstat(outside);
+  const helper = new URL('./normalize-runtime-image', import.meta.url).pathname;
+  await run('bash', [helper, f.root]);
+  assert.equal((await lstat(outside)).ino, before.ino); assert.equal((await lstat(outside)).nlink, 2);
+  assert.equal((await lstat(alias)).ino, before.ino); assert.equal(await readlink(join(f.root, 'opt/t3/excluded-link')), '../../work/data');
+});
+
+test('image normalization fails closed when a declared root is missing', async t => {
+  const f = await imageFixture(t); await rm(join(f.root, BUNDLE_ROOTS[0]), { recursive: true });
+  await assert.rejects(run('bash', [new URL('./normalize-runtime-image', import.meta.url).pathname, f.root]), error => {
+    assert.equal(error.code, 1); assert.equal(error.stdout, ''); assert.equal(error.stderr, 'Runtime image normalization failed: stage=copy\n'); return true;
+  });
 });

@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# Build-only normalization of the finished image's declared release closure.
+# Package managers may deduplicate files with hardlinks. Releases require each
+# regular file to own its inode; symlinks retain their original targets.
+set -euo pipefail
+fail() { printf 'Runtime image normalization failed: stage=%s\n' "$1" >&2; exit 1; }
+[ "$#" -le 1 ] || fail input
+image_root="${1:-/}"
+[[ "$image_root" = /* ]] || fail input
+image_root="${image_root%/}"
+script_directory="$(cd -- "$(dirname -- "$0")" && pwd)"
+if ! declared_roots="$(node --input-type=module -e '
+  import { pathToFileURL } from "node:url";
+  const { BUNDLE_ROOTS } = await import(pathToFileURL(process.argv[1]));
+  if (!Array.isArray(BUNDLE_ROOTS) || !BUNDLE_ROOTS.length || BUNDLE_ROOTS.some(path =>
+    typeof path !== "string" || !/^[a-zA-Z0-9_./-]+$/.test(path) ||
+    path.startsWith("/") || path.split("/").some(part => !part || part === "." || part === ".."))) throw Error("Invalid declared roots");
+  process.stdout.write(BUNDLE_ROOTS.join("\n"));
+' "$script_directory/../runtime-bundle.mjs" 2>/dev/null)"; then fail roots; fi
+roots=()
+while IFS= read -r path; do roots+=("$image_root/$path"); done <<< "$declared_roots"
+[ "${#roots[@]}" -gt 0 ] || fail roots
+# find does not follow symlinks. Replacing only a multiply linked regular file
+# leaves any other image paths sharing its old inode untouched.
+if ! find "${roots[@]}" -type f -links +1 -exec /bin/sh -c '
+  for path do
+    directory=$(dirname "$path") || exit 1
+    temporary=$(mktemp "$directory/.t3-image-inode.XXXXXX") || exit 1
+    if cp -p "$path" "$temporary" && mv -f "$temporary" "$path"; then :
+    else rm -f "$temporary"; exit 1; fi
+  done
+' runtime-image-normalization {} + 2>/dev/null; then fail copy; fi
+# Emit counts only; no package paths or file contents enter build diagnostics.
+if ! remaining="$(find "${roots[@]}" -type f -links +1 -exec printf x \; 2>/dev/null)"; then fail inspection; fi
+[ -z "$remaining" ] || fail invariant
+printf 'Runtime image normalized: roots=%s hardlinks=0\n' "${#roots[@]}"

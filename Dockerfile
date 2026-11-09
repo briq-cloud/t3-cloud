@@ -138,6 +138,7 @@ RUN ln -sf /opt/t3/node /usr/local/bin/node \
   && npm cache clean --force
 COPY runtime-loader.mjs runtime-supervisor.mjs runtime-process.mjs runtime-bundle.mjs runtime-ownership.mjs runtime-controller-process.mjs /opt/t3-bootstrap/
 COPY bin/t3-cloud-start /usr/local/bin/t3-cloud-start
-RUN chmod 755 /usr/local/bin/t3-cloud-start /opt/t3-cloud/bin/codex-remote /opt/t3-cloud/bin/release-shims/runtime-command
+RUN chmod 755 /usr/local/bin/t3-cloud-start /opt/t3-cloud/bin/codex-remote /opt/t3-cloud/bin/release-shims/runtime-command \
+  && bash /opt/t3-cloud/bin/normalize-runtime-image
 EXPOSE 8080
 CMD ["t3-cloud-start"]

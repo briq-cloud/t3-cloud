@@ -33,6 +33,7 @@ jobs:
       codex: ${{ steps.version.outputs.codex }}
       codex_sha256: ${{ steps.version.outputs.codex_sha256 }}
       claude: ${{ steps.version.outputs.claude }}
+      checked_image_id: ${{ steps.checked.outputs.image_id }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -160,10 +161,14 @@ jobs:
           retention-days: 3
           if-no-files-found: error
       - name: Save checked image for manual publication
+        id: checked
         if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && inputs.publish == true
         run: |
           mkdir "$RUNNER_TEMP/checked-image"
-          docker save --output "$RUNNER_TEMP/checked-image/image.tar" "$T3_IMAGE:${{ steps.version.outputs.tag }}"
+          image_id="$(docker image inspect "$T3_IMAGE:${{ steps.version.outputs.tag }}" --format '{{.Id}}')"
+          [[ "$image_id" =~ ^sha256:[a-f0-9]{64}$ ]]
+          echo "image_id=$image_id" >> "$GITHUB_OUTPUT"
+          docker save --output "$RUNNER_TEMP/checked-image/image.tar" "$image_id"
       - uses: actions/upload-artifact@v4
         if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && inputs.publish == true
         with:
@@ -202,13 +207,24 @@ jobs:
         run: docker load --input "$RUNNER_TEMP/checked-image/image.tar"
       - name: Publish checked image
         id: publish
+        env:
+          CHECKED_IMAGE_ID: ${{ needs.image.outputs.checked_image_id }}
+          TAG: ${{ needs.image.outputs.tag }}
         run: |
           set -euo pipefail
-          docker push "$T3_IMAGE:${{ needs.image.outputs.tag }}"
-          docker tag "$T3_IMAGE:${{ needs.image.outputs.tag }}" "$T3_IMAGE:latest"
-          docker push "$T3_IMAGE:latest"
-          digest="$(docker buildx imagetools inspect "$T3_IMAGE:${{ needs.image.outputs.tag }}" --format '{{json .Manifest}}' | jq -r .digest)"
+          [[ "$CHECKED_IMAGE_ID" =~ ^sha256:[a-f0-9]{64}$ ]]
+          test "$(docker image inspect "$CHECKED_IMAGE_ID" --format '{{.Id}}')" = "$CHECKED_IMAGE_ID"
+          docker tag "$CHECKED_IMAGE_ID" "$T3_IMAGE:$TAG"
+          docker push "$T3_IMAGE:$TAG" > "$RUNNER_TEMP/runtime-push.txt" 2>&1
+          digest="$(node bin/verify-runtime-push.mjs receipt "$RUNNER_TEMP/runtime-push.txt")"
+          # Bind the actual push receipt to the checked config through an immutable
+          # registry lookup. A concurrent writer changing TAG cannot substitute bytes.
+          docker buildx imagetools inspect "$T3_IMAGE@$digest" --raw > "$RUNNER_TEMP/runtime-pushed-manifest.json"
+          node bin/verify-runtime-push.mjs manifest "$RUNNER_TEMP/runtime-pushed-manifest.json" "$CHECKED_IMAGE_ID"
+          docker tag "$CHECKED_IMAGE_ID" "$T3_IMAGE:latest"
+          docker push "$T3_IMAGE:latest" > "$RUNNER_TEMP/runtime-latest-push.txt" 2>&1
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          echo "image_id=$CHECKED_IMAGE_ID" >> "$GITHUB_OUTPUT"
       - name: Attest provenance
         uses: actions/attest-build-provenance@v2
         with:
@@ -218,14 +234,14 @@ jobs:
       - name: Package published runtime
         env:
           BASE: ${{ needs.image.outputs.base }}
-          TAG: ${{ needs.image.outputs.tag }}
+          CHECKED_IMAGE_ID: ${{ steps.publish.outputs.image_id }}
           DIGEST: ${{ steps.publish.outputs.digest }}
           SOURCE: ${{ github.sha }}
         run: |
           set -euo pipefail
           root="$RUNNER_TEMP/runtime-image-root"
           mkdir "$root"
-          image_id="$(docker create "$T3_IMAGE:$TAG")"
+          image_id="$(docker create "$CHECKED_IMAGE_ID")"
           trap 'docker rm -v "$image_id" > /dev/null' EXIT
           docker export "$image_id" | tar -xf - -C "$root"
           node bin/package-runtime-release.mjs "$root" "$RUNNER_TEMP/runtime-release" "${BASE##*@}" "$SOURCE" "$T3_IMAGE@$DIGEST"

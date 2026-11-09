@@ -1,0 +1,23 @@
+export function runtimeUpdatesPage({ nonce, authorized }) {
+  return `<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>T3 Cloud updates</title>
+<style nonce="${nonce}">body{font:16px system-ui;max-width:48rem;margin:3rem auto;padding:1rem;background:#101214;color:#eee}button,input,a{font:inherit;margin:.4rem;padding:.5rem}a{color:#9bd}section{border-top:1px solid #555;padding:1rem 0}input{max-width:90%}button:disabled{opacity:.5}</style>
+<h1>T3 Cloud updates</h1><a href="/_cloud/">Connections</a><a href="/">Open T3</a>
+<form id="login" ${authorized ? 'hidden' : ''}><label>Owner key <input id="key" type="password" autocomplete="current-password" required></label><button>Sign in</button></form>
+<main id="updates" ${authorized ? '' : 'hidden'}><section><p id="status" role="status">Loading update status</p><p id="current"></p><p id="version"></p><p id="transition"></p><p id="checked"></p><button id="check">Check for updates</button><button id="update" disabled>Update</button></section>
+<section><label><input id="automatic" type="checkbox">Update automatically when idle</label><p>Automatic updates are off by default. Updates wait for active work and sign-ins to finish. After using the terminal, restart this environment before updating.</p></section></main>
+<p id="message" role="status"></p>
+<script nonce="${nonce}">
+const el=id=>document.getElementById(id);let timer,waitingUntil=0,loading=false;
+const labels={'no-release':'No runtime release available',unchecked:'Updates have not been checked',current:'Up to date',available:'New version available',blocked:'Update waiting for idle',failed:'Update could not be completed. Check again or retry.',activated:'Update complete',pending:'Update waiting for active work to finish'};
+async function request(path,data){const response=await fetch('/_cloud/'+path,{method:data===undefined?'GET':'POST',credentials:'same-origin',headers:data===undefined?{}:{'content-type':'application/json'},body:data===undefined?undefined:JSON.stringify(data)});if(!response.ok)throw Error('Update operation unavailable');return response.json();}
+function queue(delay){clearTimeout(timer);timer=setTimeout(refresh,delay);}
+async function refresh(){if(loading)return;loading=true;try{const value=await request('updates/status');el('message').textContent='';el('status').textContent=value.phase==='recovery-required'?'Update needs recovery. Admission remains closed.':value.busy?'Updating':labels[value.outcome]||'Update status unavailable';el('current').textContent=value.currentSource?'Current version: '+value.currentSource.slice(0,12):'Current version unknown';el('transition').textContent=value.receipt?'Update '+value.receipt.status+': '+(value.receipt.from==='bootstrap'?'bootstrap':value.receipt.from.slice(7,19))+' → '+value.receipt.to.slice(7,19):value.desired?'Update selected: '+value.desired.slice(7,19):value.staged?'Update prepared: '+value.staged.slice(7,19):'';el('version').textContent=value.available?'Available version: '+value.available.version:'';el('checked').textContent=value.checkedAt===null?'':'Last checked: '+new Date(value.checkedAt).toLocaleString();el('automatic').checked=value.automatic;el('automatic').disabled=value.busy;el('check').disabled=value.busy;el('update').disabled=value.busy||!value.available||value.outcome==='current'||value.outcome==='activated'||value.phase!=='running';if(value.busy||value.phase==='draining'||Date.now()<waitingUntil)queue(2000);}catch{el('message').textContent='Update status unavailable. The app may be restarting.';if(Date.now()<waitingUntil)queue(2000);}finally{loading=false;}}
+async function run(action){try{await action();}catch{el('message').textContent='Update operation unavailable';}}
+el('login').onsubmit=event=>{event.preventDefault();const key=el('key').value;el('key').value='';run(async()=>{await request('login',{key});location.replace('/_cloud/updates');});};
+el('check').onclick=()=>run(async()=>{el('check').disabled=true;el('message').textContent='Checking for updates';await request('updates/check',{});await refresh();});
+el('update').onclick=()=>run(async()=>{el('update').disabled=true;el('message').textContent='Preparing update';waitingUntil=Date.now()+360000;await request('updates/update',{});queue(500);});
+el('automatic').onchange=()=>run(async()=>{await request('updates/automatic',{enabled:el('automatic').checked});await refresh();});
+window.addEventListener('pagehide',()=>clearTimeout(timer));
+${authorized ? 'refresh();' : ''}
+</script></html>`;
+}

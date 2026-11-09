@@ -98,7 +98,7 @@ test('controller stop joins its active activation and saves terminal preferences
     import { RuntimeUpdates } from ${JSON.stringify(new URL('./runtime-updates.mjs', import.meta.url).href)};
     serveRuntimeController(process, { createUpdates(options) {
       const updates = new RuntimeUpdates({ ...options, consumer: {
-        check: async () => ({ tag: 'runtime-${nextSource}', source: '${nextSource}', publishedAt: '2026-11-09T00:00:00Z', sizes: { 'manifest.json': 1, 'runtime-blobs.tar': 1 } }),
+        check: async () => ({ tag: 'runtime-${nextSource}', source: '${nextSource}', publishedAt: '2026-11-09T00:00:00Z', sizes: { 'manifest.json': 1, 'runtime-blobs.tar': 1, 'runtime-attestation.jsonl': 1 } }),
         stage: async () => ({ identity: '${identity}' }) } });
       const initialize = updates.initialize.bind(updates);
       updates.initialize = async () => { await initialize(); await updates.check(); };
@@ -129,4 +129,41 @@ test('recovery remains inspectable for unknown preference migrations without rew
   assert.equal((await controller.initialize()).phase, 'running');
   const { readFile } = await import('node:fs/promises');
   assert.equal(await readFile(file, 'utf8'), '{"protocol":999}');
+});
+
+test('premature controller exit during stop fences the unknown outcome exactly once', async () => {
+  const child = new FakeChild(); let failures = 0;
+  const controller = runtimeControllerProcess({ root: '/', state: '/state', spawnProcess: () => child, onFailure: () => { failures++; } });
+  const stop = controller.stop();
+  assert.equal(child.messages[0].method, 'stop');
+  child.emit('exit');
+  await assert.rejects(stop, /outcome unknown/);
+  assert.equal(failures, 1);
+  await assert.rejects(controller.stop(), /outcome unknown/);
+  assert.equal(child.messages.length, 1);
+});
+
+test('only an acknowledged stop makes the owned disconnect and exit expected', async () => {
+  const child = new FakeChild(); let failures = 0;
+  child.disconnect = () => { child.connected = false; child.emit('disconnect'); child.emit('exit'); };
+  const controller = runtimeControllerProcess({ root: '/', state: '/state', spawnProcess: () => child, onFailure: () => { failures++; } });
+  const stop = controller.stop(); const sent = child.messages[0];
+  child.emit('message', { protocol: 1, channel: 'runtime-controller', session: sent.session, kind: 'result', id: sent.id, ok: true, result: {} });
+  await stop;
+  assert.equal(failures, 0); assert.equal(child.killed, undefined);
+  assert.equal(controller.alive, false);
+});
+
+
+test('an error after acknowledged disconnect still fences an unknown termination', async () => {
+  const child = new FakeChild(); let failures = 0;
+  child.disconnect = () => {
+    child.connected = false; child.emit('disconnect');
+    child.emit('error', Error('termination failed')); child.emit('exit');
+  };
+  const controller = runtimeControllerProcess({ root: '/', state: '/state', spawnProcess: () => child, onFailure: () => { failures++; } });
+  const stop = controller.stop(); const sent = child.messages[0];
+  child.emit('message', { protocol: 1, channel: 'runtime-controller', session: sent.session, kind: 'result', id: sent.id, ok: true, result: {} });
+  await assert.rejects(stop, /termination unknown/);
+  assert.equal(failures, 1); assert.equal(child.killed, true);
 });

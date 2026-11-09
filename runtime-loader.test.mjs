@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
-import { createServer } from 'node:net';
+import { createServer, connect } from 'node:net';
 import { once } from 'node:events';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -23,10 +23,16 @@ async function unusedPort() {
   const server = createServer(); server.listen(0, '127.0.0.1'); await once(server, 'listening');
   const port = server.address().port; await new Promise(resolve => server.close(resolve)); return port;
 }
-async function fixture(t, { recovery = false, unknown = false, journal, ownershipEvidence, releaseController = false } = {}) {
+async function fixture(t, { recovery = false, unknown = false, journal, ownershipEvidence, releaseController = false, expectedCloseFailure = false } = {}) {
   const state = await mkdtemp(join(tmpdir(), 't3-loader-integration-'));
   let loader;
-  t.after(async () => { await loader?.close(); await rm(state, { recursive: true, force: true }); });
+  t.after(async () => {
+    try { await loader?.close(); } catch (error) { if (!expectedCloseFailure) throw error; }
+    finally {
+      if (expectedCloseFailure) await loader?.supervisor.driver.stop();
+      await rm(state, { recursive: true, force: true });
+    }
+  });
   const baseImageFile = join(state, 'base-image'), sourceFile = join(state, 'source');
   await writeFile(baseImageFile, `sha256:${'c'.repeat(64)}`);
   if (!unknown) await writeFile(sourceFile, 'd'.repeat(40));
@@ -71,14 +77,14 @@ async function fixture(t, { recovery = false, unknown = false, journal, ownershi
       import { RuntimeUpdates } from ${JSON.stringify(new URL('./runtime-updates.mjs', import.meta.url).href)};
       serveRuntimeController(process, { createUpdates(options) {
         const updates = new RuntimeUpdates({ ...options, schedule: () => ({ unref() {} }), cancel() {}, consumer: {
-          check: async () => ({ tag: 'runtime-${source}', source: '${source}', publishedAt: '2026-11-09T00:00:00Z', sizes: { 'manifest.json': 1, 'runtime-blobs.tar': 1 } }),
+          check: async () => ({ tag: 'runtime-${source}', source: '${source}', publishedAt: '2026-11-09T00:00:00Z', sizes: { 'manifest.json': 1, 'runtime-blobs.tar': 1, 'runtime-attestation.jsonl': 1 } }),
           stage: () => options.stage(${JSON.stringify(join(state, 'updates/download-Abc123/manifest.json'))}, ${JSON.stringify(join(state, 'updates/download-Abc123/blobs'))}) } });
         const status = updates.status.bind(updates);
         updates.status = async () => ({ ...await status(), controllerVersion: '${version}' });
         return updates;
       } });`);
   }
-  let starts = 0, updateWork, controllerWork; const recoveries = [], controllers = [];
+  let starts = 0, updateWork, controllerWork, controllerTerminal; const recoveries = [], controllers = [];
   const port = await unusedPort();
   loader = await startLoader({ PORT: String(port), T3_HOST: '127.0.0.1', T3_CWD: state, T3_CLOUD_STATE: state,
     T3_CLOUD_PUBLIC_ORIGIN: origin, T3_CLOUD_OWNER_KEY: key, T3_CLOUD_OWNER_ID: 'owner' }, {
@@ -88,6 +94,7 @@ async function fixture(t, { recovery = false, unknown = false, journal, ownershi
     } }),
     createSupervisor: options => new RuntimeSupervisor({ ...options, verify: async () => ({ source }), stage: async () => ({ identity }) }),
     createUpdates: options => {
+      controllerTerminal = options.onTerminal;
       if (releaseController) {
         const controller = runtimeControllerProcess({ ...options,
           onTerminal: () => (controllerWork = options.onTerminal()),
@@ -112,7 +119,7 @@ async function fixture(t, { recovery = false, unknown = false, journal, ownershi
     const text = await response.text();
     return { status: response.status, headers: response.headers, text, value: (() => { try { return JSON.parse(text); } catch { return null; } })() };
   };
-  return { state, loader, send, recoveries, controllers, waitController: async () => { await new Promise(resolve => setImmediate(resolve)); await controllerWork; }, starts: () => starts, waitUpdate: async () => { await new Promise(resolve => setImmediate(resolve)); await updateWork; } };
+  return { state, port, loader, send, recoveries, controllers, controllerTerminal: () => controllerTerminal(), waitController: async () => { await new Promise(resolve => setImmediate(resolve)); await controllerWork; }, starts: () => starts, waitUpdate: async () => { await new Promise(resolve => setImmediate(resolve)); await updateWork; } };
 }
 
 test('authenticated owner update crosses real IPC; drain status stays available and committed receipt survives manager replacement', async t => {
@@ -211,4 +218,47 @@ test('committed activation joins old updater and launches the selected release c
   assert.equal(current.currentSource, source);
   assert.equal(current.receipt.status, 'committed');
   assert.equal(current.outcome, 'activated');
+});
+
+
+test('loader shutdown immediately fences established sockets even when updater stop is unknown', async t => {
+  const f = await fixture(t, { expectedCloseFailure: true });
+  assert.equal(f.loader.supervisor.admitting, true);
+  const socket = connect(f.port, '127.0.0.1');
+  socket.on('error', () => {}); t.after(() => socket.destroy());
+  await once(socket, 'connect');
+  // Keep an admitted HTTP connection established across shutdown.
+  socket.write('GET /native HTTP/1.1\r\nHost: cloud.example\r\n');
+  await new Promise(resolve => setImmediate(resolve));
+  const closed = new Promise(resolve => socket.once('close', resolve));
+  let stopCalls = 0;
+  f.loader.updates.stop = async () => { stopCalls++; throw Error('Runtime controller termination unknown'); };
+  const closing = f.loader.close();
+  assert.equal(f.loader.supervisor.admitting, false);
+  await assert.rejects(closing, /termination unknown/);
+  await closed;
+  assert.equal(stopCalls, 1);
+  assert.equal(f.loader.supervisor.driver.alive, true);
+  assert.equal(f.loader.supervisor.journal.phase, 'running');
+  await assert.rejects(f.loader.close(), /termination unknown/);
+  assert.equal(stopCalls, 1);
+});
+
+
+test('failed controller replacement fences established sockets and retains recovery state', async t => {
+  const f = await fixture(t, { expectedCloseFailure: true });
+  const socket = connect(f.port, '127.0.0.1');
+  socket.on('error', () => {}); t.after(() => socket.destroy());
+  await once(socket, 'connect');
+  socket.write('GET /native HTTP/1.1\r\nHost: cloud.example\r\n');
+  await new Promise(resolve => setImmediate(resolve));
+  const closed = new Promise(resolve => socket.once('close', resolve));
+  f.loader.updates.stop = async () => { throw Error('Runtime controller termination unknown'); };
+  await f.loader.supervisor.save({ current: identity, desired: null, receipt: { from: 'bootstrap', to: identity, status: 'committed' } });
+  await assert.rejects(f.controllerTerminal(), /termination unknown/);
+  await closed;
+  assert.equal(f.loader.supervisor.admitting, false);
+  assert.equal(f.loader.supervisor.journal.phase, 'recovery-required');
+  assert.equal((await f.send('/native')).status, 503);
+  assert.equal(f.loader.supervisor.driver.alive, true);
 });

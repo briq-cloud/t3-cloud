@@ -56,6 +56,7 @@ export async function startLoader(env = process.env, {
   const driver = createDriver(env);
   const supervisor = createSupervisor({ state, baseImage, driver });
   let updates, recoveryServer, closing, controllerIdentity, controllerRecovery, controllerFault = false, bootstrapSource = null, transition, updateScheduled = false;
+  const fenceAdmission = () => { controllerFault = true; supervisor.admitting = false; for (const listener of listeners) listener.fence(); };
   const createController = async recovery => {
     const current = supervisor.journal.current;
     const selected = !recovery && current !== 'bootstrap' ? await supervisor.verifyRelease(current) : null;
@@ -65,7 +66,7 @@ export async function startLoader(env = process.env, {
       status: async () => supervisor.journal, activity: () => driver.activity(),
       stage: (file, blobs) => supervisor.stageRelease(file, blobs), activate: () => supervisor.activate(),
       completeDrain: () => supervisor.completeDrain(), onTerminal: () => replaceController(false),
-      onFailure: () => { controllerFault = true; supervisor.admitting = false; for (const listener of listeners) listener.fence(); } });
+      onFailure: fenceAdmission });
     try { await controller.initialize(); } catch (error) { try { await controller.stop(); } catch {} throw error; }
     controllerIdentity = current; controllerRecovery = recovery;
     return controller;
@@ -83,7 +84,7 @@ export async function startLoader(env = process.env, {
       updates = await createController(false);
       await updates.start();
     })().catch(async error => {
-      supervisor.admitting = false;
+      fenceAdmission();
       await supervisor.save({ phase: 'recovery-required' });
       throw error;
     }).finally(() => { transition = null; });
@@ -138,19 +139,29 @@ export async function startLoader(env = process.env, {
       await new Promise((resolve, reject) => { recoveryServer.once('error', reject); recoveryServer.listen(8084, '127.0.0.1', resolve); });
     } else await updates.start();
     return { supervisor, get updates() { return updates; }, status, close() {
-      return closing ??= (async () => {
-        await transition;
-        await updates.stop();
-        supervisor.admitting = false;
-        for (const listener of listeners) listener.fence();
-        if (recoveryServer) { recoveryServer.closeAllConnections(); await new Promise(resolve => recoveryServer.close(resolve)); }
-        await supervisor.shutdown();
-        await Promise.all(listeners.map(listener => listener.close()));
-        await ownership.close({ clean: !driver.alive });
+      if (closing) return closing;
+      // Fence before joining either updater work or a release transition. An
+      // unknown stop must never leave established sockets serving native work.
+      fenceAdmission();
+      return closing = (async () => {
+        let stopped = false;
+        try {
+          await transition;
+          await updates.stop();
+          stopped = true;
+          await supervisor.shutdown();
+        } finally {
+          if (recoveryServer) { recoveryServer.closeAllConnections(); await new Promise(resolve => recoveryServer.close(resolve)); }
+          await Promise.all(listeners.map(listener => listener.close()));
+          // A failed join retains ambiguous durable ownership; no replay or
+          // supervisor mutation is attempted while updater work is unknown.
+          await ownership.close({ clean: stopped && !driver.alive });
+        }
       })();
     } };
   } catch (error) {
-    await updates?.stop();
+    fenceAdmission();
+    try { await updates?.stop(); } catch { /* Preserve unknown ownership and the original startup failure. */ }
     if (recoveryServer) { recoveryServer.closeAllConnections(); recoveryServer.close(); }
     supervisor.admitting = false;
     if (supervisor.journal && driver.alive) {

@@ -26,15 +26,16 @@ export function runtimeControllerProcess({ root = '/', state, currentSource, rec
   onTerminal = () => {}, onFailure = () => {}, env = process.env, spawnProcess = spawn, timeout = 660000 }) {
   if (!isAbsolute(root) || !isAbsolute(state)) throw Error('Absolute controller paths required');
   const session = randomUUID(), pending = new Map();
-  let child, sequence = 0, highwater = 0, failed = false, exited = false, inflight = 0, stopping = false, stopPromise;
-  const fail = () => {
-    const first = !failed;
+  let child, sequence = 0, highwater = 0, failed = false, failureReported = false, exited = false, inflight = 0, stopAcknowledged = false, stopPromise;
+  const fail = (expected = false) => {
+    const report = expected !== true && !failureReported;
+    if (report) failureReported = true;
     failed = true;
     for (const entry of pending.values()) { clearTimeout(entry.timer); entry.reject(Error('Runtime controller outcome unknown')); }
     pending.clear();
     // Only this owned child handle is terminated. Its unknown command is never replayed.
-    if (first && child && !exited) { try { child.kill('SIGTERM'); } catch {} }
-    if (first && !stopping) { try { onFailure(); } catch {} }
+    if (report && child && !exited) { try { child.kill('SIGTERM'); } catch {} }
+    if (report) { try { onFailure(); } catch {} }
   };
   const send = value => {
     if (exited || !child.connected) return;
@@ -58,7 +59,8 @@ export function runtimeControllerProcess({ root = '/', state, currentSource, rec
       // Late replies cannot resolve a new session or a different command.
       if (!entry) { fail(); return; }
       pending.delete(value.id); clearTimeout(entry.timer);
-      value.ok ? entry.resolve(value.result) : entry.reject(Error('Runtime controller operation unavailable'));
+      if (entry.method === 'stop' && value.ok) stopAcknowledged = true;
+      value.ok ? entry.resolve(value.result) : entry.reject(Error(`Runtime controller ${entry.method} unavailable`));
       if (entry.method === 'update' || entry.method === 'tick') Promise.resolve().then(onTerminal).catch(fail);
       return;
     }
@@ -77,7 +79,9 @@ export function runtimeControllerProcess({ root = '/', state, currentSource, rec
   child = spawnProcess(join(root, 'opt/t3/node'), [join(root, 'opt/t3-cloud/runtime-controller.mjs')],
     { cwd: '/', env: controllerEnvironment(env), stdio: ['ignore', 'ignore', 'ignore', 'ipc'] });
   child.on('message', receive);
-  child.once('exit', () => { exited = true; fail(); }); child.on('error', fail); child.once('disconnect', fail);
+  child.once('exit', () => { exited = true; fail(stopAcknowledged && pending.size === 0 && inflight === 0); });
+  child.on('error', () => fail());
+  child.once('disconnect', () => fail(stopAcknowledged && pending.size === 0 && inflight === 0));
   return {
     initialize: () => call('initialize', [{ state, currentSource, recovery, session }]),
     status: () => call('status'), check: () => call('check'), update: () => call('update'), tick: () => call('tick'),
@@ -85,17 +89,17 @@ export function runtimeControllerProcess({ root = '/', state, currentSource, rec
     start: () => call('start'),
     stop() {
       return stopPromise ??= (async () => {
+        if (failureReported) throw Error('Runtime controller termination unknown');
         if (exited) return;
-        stopping = true;
         if (failed) throw Error('Runtime controller termination unknown');
         await call('stop');
         if (exited) return;
         await new Promise((resolve, reject) => {
-          const timer = setTimeout(() => reject(Error('Runtime controller termination unknown')), 10000); timer.unref?.();
-          child.once('exit', () => { clearTimeout(timer); resolve(); });
+          const timer = setTimeout(() => { fail(); reject(Error('Runtime controller termination unknown')); }, 10000); timer.unref?.();
+          child.once('exit', () => { clearTimeout(timer); failureReported ? reject(Error('Runtime controller termination unknown')) : resolve(); });
           child.disconnect();
         });
-      })();
+      })().catch(error => { fail(); throw error; });
     },
     get alive() { return !exited; },
   };

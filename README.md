@@ -5,7 +5,7 @@ Dockerfile uses the pinned T3 source, runtime versions, and locked dependencies 
 this repository. Pull requests run runtime tests and offline image checks; an
 explicitly dispatched release publishes an immutable date tag and `latest`.
 
-Build locally with `docker build --platform linux/amd64 -t t3-cloud:local .` and run the runtime checks
+Build locally with `docker build --platform linux/amd64 --build-arg SOURCE_COMMIT=$(git rev-parse HEAD) -t t3-cloud:local .` and run the runtime checks
 with `npm ci --ignore-scripts && npm test`. The image build fetches the pinned
 upstream source and verified release artifacts.
 

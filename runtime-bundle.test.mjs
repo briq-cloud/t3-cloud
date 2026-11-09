@@ -141,7 +141,8 @@ test('attestation consumes captured private bytes even when original input chang
   await writeFile(join(root, 'runtime-attestation.jsonl'), 'untrusted evidence fixture');
   const file = join(root, 'manifest.json'), original = JSON.stringify(fixture());
   await writeFile(file, original);
-  const result = await verifyManifestAttestation(file, { run: async (_cli, args) => {
+  const result = await verifyManifestAttestation(file, { run: async (_cli, args, options) => {
+    assert.equal(options.timeout, 30000);
     assert.notEqual(args[2], file);
     assert.equal(await readFile(args[2], 'utf8'), original);
     const captured = args[args.indexOf('--bundle') + 1];

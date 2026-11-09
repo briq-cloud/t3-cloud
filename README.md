@@ -181,6 +181,30 @@ verifies the publisher attestation and staged bytes, and refuses existing loader
 or activation history. It inventories only the two legacy lock directories;
 login, pairing and native session files are never read.
 
+For a small existing disk, use the separate metadata-only protocol. Put only
+`manifest.json` and `runtime-attestation.jsonl` in
+`$T3_CLOUD_STATE/updates/bootstrap-image-input/`, then run
+`node bin/prepare-bootstrap-metadata.mjs` with the same protected configuration.
+It verifies and durably captures signed metadata and records protocol 2,
+`mode: target-image`, `phase: metadata-prepared`. It neither downloads an archive
+nor installs a release. Protocol 1 preparation remains a fully staged operation.
+
+Stop the exact old runtime and prove its exit before changing the volume, image
+or protected environment. Keep the same home and owner identity. After any needed
+disk growth, start the exact pinned target image once; it remains management-only.
+Explicit recovery checks revisions, the changed boot, signed inventory and legacy
+fingerprints, then copies only application paths from that image into a sealed,
+content-addressed release. Every file, mode and link is checked against the signed
+inventory. The image is a source of candidate bytes, not verification authority.
+Installation reserves the full file inventory plus filesystem and application
+headroom using measured free bytes and inodes.
+
+An interrupted partial installation remains evidence and blocks another copy;
+inspect it explicitly. A complete published installation can be reverified and
+reused by the same migration. Recovery never copies credentials or restores the
+legacy runtime automatically. These local checks do not qualify a real volume
+growth or same-home migration.
+
 After image replacement, refresh the deployment's `T3_CLOUD_CHILD_IMAGE` to the
 actual replacement digest. Keep the same durable home and owner binding. The new
 loader serves only the owner management page until the owner explicitly chooses

@@ -38,7 +38,9 @@ export function createCloudManager({ role, publicOrigin, ownerKey, ownerId, allo
   const terminal = cloudProxy({ target: terminalTarget, publicOrigin: auth.origin, ownerBearer: req => auth.ownerBearer(req), terminal: true });
   const ownerGeneration = digest(canonicalJson(['managed-owner-generation', ownerId, ownerKey]));
   let allocating = 0;
+  const updateRequests = new Set();
   const server = createServer(async (req, res) => {
+    updateRequests.add(res); res.once('close', () => updateRequests.delete(res));
     try {
       const url = new URL(req.url, auth.origin);
       if (url.pathname === '/_cloud/briq/mcp') {
@@ -250,10 +252,11 @@ export function createCloudManager({ role, publicOrigin, ownerKey, ownerId, allo
     if (!ready()) return denySocket(socket);
     if (path === '/_cloud/bridge' && role === 'central' && bridgeUpgrade) return bridgeUpgrade(req, socket, head);
     if (path.startsWith('/_cloud/')) {
-      if (path.startsWith('/_cloud/terminal/') && auth.authorized(req) && auth.mutation(req)) return terminal.upgrade(req, socket, head);
+      if (path.startsWith('/_cloud/terminal/') && auth.authorized(req) && auth.mutation(req)) { server.updateTerminalUsed = true; return terminal.upgrade(req, socket, head); }
       return denySocket(socket);
     }
     native.upgrade(req, socket, head);
   });
+  server.updateRequests = updateRequests;
   return server;
 }

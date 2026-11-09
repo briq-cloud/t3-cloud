@@ -107,6 +107,8 @@ export function nativeConnections(env = process.env, { signIn = (options, ended)
       await nativeAuth([kind, 'revoke', id]);
       return { revoked: true };
     },
+    updateIdle() { return !releaseClaude && !releaseBriq && !claudeLifetimeUnknown &&
+      !['starting', 'waiting'].includes(claude.status.state) && !['starting', 'waiting'].includes(briq.status.state); },
     close() { claude.cancel(); briq.cancel(); },
   };
 }

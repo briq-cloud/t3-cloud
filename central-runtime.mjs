@@ -96,7 +96,7 @@ export async function createCentralRuntime(env = process.env, dependencies = {})
     claude = (dependencies.createClaudeRuntime ?? (options => new ClaudeRuntime(options)))({ store, ledger: claudeLedger, cloud, scopedBriq, directory: join(directory, 'claude'), nativeHome: env.HOME, nativeConfigDirectory: env.CLAUDE_CONFIG_DIR });
     const admittedProviders = Object.freeze(['codex', ...(claude.enabled === true ? ['claudeAgent'] : [])]);
     const broker = new CapabilityBroker({ store, app, claude, briqTransport, admittedProviders });
-    let ready = false, restoring, retryRestore = false;
+    let ready = false, restoring, retryRestore = false, draining = false;
     function restore() {
       if (stopped) throw Error('Central runtime stopped');
       if (restoring) return restoring;
@@ -238,7 +238,30 @@ export async function createCentralRuntime(env = process.env, dependencies = {})
         });
       } catch { session?.close(); socket.end('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n'); }
     }
-    return { allocator, broker, admittedProviders, bridgeUpgrade, close, restore, ready: () => ready && !stopped, briqMcpRequest: (req, res) => briqTransport.handle(req, res),
+    async function updateActivity() {
+      // Existing broker ownership and durable ledgers are authoritative. An
+      // unresolved marker is busy even if no process or client is connected.
+      let unresolved = 0;
+      for (const binding of [...await store.list(), ...await store.listSources()]) {
+        if (binding.restoreState || ['unknown', 'started'].includes(binding.nativeState) ||
+            binding.turnState === 'unknown' || binding.nativeCleanup && binding.nativeCleanup.state !== 'completed' ||
+            binding.rootStop && binding.rootStop.state !== 'completed') unresolved++;
+        if (binding.purpose === 'project-source') {
+          if (binding.state !== 'ready' && binding.state !== 'revoked' || binding.preparationSession) unresolved++;
+          continue;
+        }
+        unresolved += (await store.mutationMarkers(binding.threadId)).length;
+        unresolved += (await store.listOperations(binding.threadId)).filter(row =>
+          row.method === 'briq/scoped' ? row.state !== 'completed' : row.state !== 'adopted').length;
+      }
+      const counts = { activeTurns: broker.activeTurns.size, pendingTurns: broker.pendingTurns.size,
+        mutations: broker.mutations.size, logins: broker.loginPending.size, approvals: broker.approvals.size, serialized: store.active.size,
+        claude: Number(Boolean(claude.owner || claude.metadataOwner)), unresolved,
+        preparations: bridgeLeases.size, restoring: Number(Boolean(restoring)), unavailable: Number(broker.unavailable) };
+      return { idle: draining && Object.values(counts).every(value => value === 0), counts };
+    }
+    return { allocator, broker, admittedProviders, bridgeUpgrade, close, restore, ready: () => ready && !stopped && !draining,
+      drain: () => { draining = true; broker.draining = true; }, updateActivity, briqMcpRequest: (req, res) => briqTransport.handle(req, res),
       claudeCredentialOwner: claude.credentials, briqCredentialOwner: cloud.credentialOwner };
   } catch (error) { await close(); throw error; }
 }

@@ -125,3 +125,42 @@ Set `T3_CLOUD_NATIVE_ORIGIN` only to the designated secondary HTTPS origin. The 
 Connections exposes pending-code revocation separately from native-session revocation. Clearing a displayed code removes it from the page; use Revoke pending code to invalidate it. Revoking a session uses the native CLI to update T3 access control, then disconnects all public native connections before reporting success. Other authorized clients can reconnect; the revoked session cannot. Private management, terminal and bridge connections stay connected. Signed attachment links are capabilities and may remain usable until expiry. Pairing codes and QR data stay in page memory and clear on expiry, logout, page exit or replacement.
 
 Source checks and synthetic native conformance do not qualify an installed phone or deployment. Release acceptance still requires the official app to pair to the central identity and create two threads with distinct managed workspaces.
+
+### Application runtime activation candidate
+
+The image now has a dependency-free bootstrap loader at `/opt/t3-bootstrap`.
+It keeps ports 8080 and the optional phone port 8081 stable while a manager using
+the selected release's Node and dependencies listens only on 8082/8083.
+The original manager and native frontdoor still enforce authentication, origins,
+headers and WebSocket admission. State, vendor homes and native pairing identity
+keep their existing paths. New allocations use the child image digest from the
+attested release; existing allocations keep their recorded identities.
+
+`RuntimeSupervisor.stageRelease()` accepts local content-addressed blobs and a
+GitHub-attested manifest, checks base OS compatibility, and records its digest.
+`activate()` durably records the desired release before fencing admission;
+`completeDrain()` can finish a live pending drain. The manager checks its actual
+broker turns, pending mutations, allocation ledgers and process ownership before
+shutdown. Standalone activation is unavailable without a trustworthy native idle
+interface. Using the terminal also blocks automatic activation for that process
+lifetime, since the current terminal offers no proof that background work ended.
+
+Every selected release is rehashed before execution. Read-only staged files are
+an accident guard; the same OS user can change their permissions, so the digest
+check is still required. The manifest pins the sandbox base OS digest; an
+incompatible base requires an explicit image/bootstrap upgrade. The bootstrap
+verifier stays in the base image and cannot be replaced by an application bundle.
+
+The journal records staged, desired, current, phase and activation receipt with
+atomic rename and fsync. Admission opens after native HTTP and broker health
+checks and the committed receipt. An interrupted transition, unclean process
+restart, stale loader lock or failed new runtime stays closed for explicit
+reconciliation. The loader never kills a persisted PID, replays a native turn,
+or automatically rolls back after a possible state migration.
+
+This is a local lifecycle candidate. Authenticated update discovery, downloading,
+manual/automatic update controls and recovery UI still need integration. Installing
+the bootstrap into an existing home and proving it survives real sandbox cold
+boots are incomplete. No production or staging rollout, official-phone update,
+GitHub attestation verification against a published release, or end-to-end cloud
+activation has been qualified by these tests.

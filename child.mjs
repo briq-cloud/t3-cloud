@@ -1,3 +1,4 @@
+import { runtimePath, runtimePathEnv } from './runtime-paths.mjs';
 import { providerInstanceId, isThreadIdentifier } from './allocations.mjs';
 import { bridgeOptions } from './edge-auth.mjs';
 import { childFrontdoor } from './child-frontdoor.mjs';
@@ -21,13 +22,14 @@ const stamp = JSON.stringify({ binding, ...(sourceOnly ? { purpose: 'project-sou
 try { await writeFile(`${state}/briq-binding.json`, stamp, { flag: 'wx', mode: 0o600 }); }
 catch (error) { if (error.code !== 'EEXIST') throw error; const prior = JSON.parse(await readFile(`${state}/briq-binding.json`, 'utf8')); if (prior.binding !== binding || prior.threadId !== threadId || (sourceOnly ? prior.purpose !== 'project-source' : providerInstanceId(prior.providerInstanceId) !== provider) || JSON.stringify(prior.project) !== JSON.stringify(project)) throw Error('Child volume belongs to another allocation'); }
 const settings = { providerInstances: {
-  codex: { driver: 'codex', enabled: provider === 'codex', config: { setupMode: 'existing', binaryPath: '/opt/t3-cloud/bin/codex-remote', homePath: codexHome, shadowHomePath: '', launchArgs: '' } },
+  codex: { driver: 'codex', enabled: provider === 'codex', config: { setupMode: 'existing', binaryPath: runtimePath(envInput, 'opt/t3-cloud/bin/codex-remote'), homePath: codexHome, shadowHomePath: '', launchArgs: '' } },
   claudeAgent: { driver: 'claudeAgent', enabled: provider === 'claudeAgent' },
 } };
 // A fresh private native state is intentional; provider settings cannot select a real app-server.
 await writeFile(`${state}/userdata/settings.json`, JSON.stringify(settings), { mode: 0o600 });
 // No cloud keys, vendor login homes, or inherited MCP configuration enter either child runtime.
-const env = { HOME: `${state}/home`, CODEX_HOME: codexHome, PATH: '/usr/local/bin:/usr/bin:/bin', LANG: 'C.UTF-8',
+const env = { HOME: `${state}/home`, CODEX_HOME: codexHome, PATH: runtimePathEnv(envInput), LANG: 'C.UTF-8',
+  ...(envInput.T3_RELEASE_ROOT ? { T3_RELEASE_ROOT: envInput.T3_RELEASE_ROOT, T3_CLOUD_STATE: envInput.T3_CLOUD_STATE } : {}),
   T3_CLOUD_ROLE: 'child', T3_CLOUD_PROVIDER_INSTANCE_ID: provider, T3_CLOUD_THREAD_ID: threadId, T3_CLOUD_BINDING_ID: binding,
   ...(sourceOnly ? { T3_CLOUD_PURPOSE: 'project-source' } : { T3_CLOUD_BRIDGE_URL: url, T3_CLOUD_BRIDGE_TOKEN: envInput.T3_CLOUD_BRIDGE_TOKEN, T3_CLOUD_EDGE_TOKEN: envInput.T3_CLOUD_EDGE_TOKEN }),
   ...(project ? { T3_CLOUD_SOURCE_ID: project.sourceId, T3_CLOUD_SOURCE_DIGEST: project.sourceDigest, T3_CLOUD_PROJECT_ID: project.projectId, T3_CLOUD_PROJECT_ROOT: project.workspaceRoot, T3_CLOUD_OWNER_GENERATION: project.ownerGeneration, ...(sourceOnly ? {} : { T3_CLOUD_LAUNCH_DIGEST: project.launchDigest }) } : {}),
@@ -43,7 +45,7 @@ let shuttingDown = false;
 function shutdown(code) { if (shuttingDown) return; shuttingDown = true; process.exitCode = code; void frontdoor.close(); for (const child of children) child.kill('SIGTERM'); }
 for (const [command, args, environment] of [
   ... (sourceOnly ? [] : [['codex', ['exec-server', '--listen', 'ws://127.0.0.1:3774', '--ws-auth', 'capability-token', '--ws-token-sha256', envInput.T3_CLOUD_EXEC_TOKEN_SHA256], executorEnv]]),
-  ['/opt/t3/t3', ['serve', '--host', '127.0.0.1', '--port', '3773', '--base-dir', state, '--no-browser', root], env],
+  [runtimePath(envInput, 'opt/t3/t3'), ['serve', '--host', '127.0.0.1', '--port', '3773', '--base-dir', state, '--no-browser', root], env],
 ]) {
   const child = spawnProcess(command, args, { cwd: root, env: environment, stdio: ['ignore', 'ignore', 'ignore'] });
   children.push(child); child.once('error', () => shutdown(1)); child.once('exit', () => shutdown(shuttingDown ? process.exitCode ?? 0 : 1));

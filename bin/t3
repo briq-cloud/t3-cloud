@@ -1,0 +1,4 @@
+#!/bin/sh
+set -eu
+runtime=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+exec "$runtime/node" "$runtime/dist/bin.mjs" "$@"

@@ -1,0 +1,11 @@
+#!/bin/sh
+set -eu
+root=$(CDPATH= cd -- "$(dirname -- "$0")/../../../.." && pwd)
+case "${0##*/}" in
+  node) exec "$root/opt/t3/node" "$@" ;;
+  t3) exec "$root/opt/t3/t3" "$@" ;;
+  codex) exec "$root/opt/codex/bin/codex" "$@" ;;
+  briq) exec "$root/opt/briq-cli/node_modules/.bin/briq" "$@" ;;
+  claude|ttyd|show-url|xdg-open) name=${0##*/}; [ "$name" != xdg-open ] || name=show-url; exec "$root/usr/local/bin/$name" "$@" ;;
+  *) exit 126 ;;
+esac

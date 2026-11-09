@@ -1,11 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { mkdtemp, mkdir, writeFile, readFile, readdir, rm, symlink, stat } from 'node:fs/promises';
+import { mkdtemp, mkdir, writeFile, readFile, readdir, rm, symlink, stat, truncate } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { REQUIRED_BUNDLE_PATHS } from '../runtime-bundle.mjs';
-import { packRuntimeArchive, unpackRuntimeArchive, verifyAndUnpackRuntimeArchive } from './runtime-archive.mjs';
+import { MAX_RUNTIME_ARCHIVE_BYTES, runtimeArchiveVerificationTimeout, packRuntimeArchive, unpackRuntimeArchive, verifyAndUnpackRuntimeArchive } from './runtime-archive.mjs';
 
 const contents = Buffer.from('archive contract fixture\n');
 const hash = createHash('sha256').update(contents).digest('hex');
@@ -34,6 +34,18 @@ function fixChecksum(bytes) {
   for (let i = 0; i < 512; i++) sum += bytes[i];
   bytes.write(sum.toString(8).padStart(6, '0') + '\0 ', 148, 'ascii');
 }
+
+test('archive verification budget rounds size up and remains capped', () => {
+  const mib = 1024 * 1024;
+  for (const [bytes, timeout] of [[1, 31000], [16 * mib - 1, 31000], [16 * mib, 31000],
+    [16 * mib + 1, 32000], [1429248000, 116000], [MAX_RUNTIME_ARCHIVE_BYTES, 144000],
+    [149 * 16 * mib, 179000], [149 * 16 * mib + 1, 180000], [150 * 16 * mib, 180000], [151 * 16 * mib, 180000]]) {
+    assert.equal(runtimeArchiveVerificationTimeout(bytes), timeout);
+  }
+  for (const bytes of [0, -1, NaN, Infinity, 1.5, '1024', Number.MAX_SAFE_INTEGER + 1]) {
+    assert.throws(() => runtimeArchiveVerificationTimeout(bytes), /Invalid release archive size/);
+  }
+});
 
 test('standard USTAR round trip deduplicates manifest blobs and seals output files', async t => {
   const f = await fixture(t);
@@ -90,6 +102,7 @@ test('real verifier failure prevents extraction; invocation pins source and iden
     assert.equal(options.env.HOME, '/nonexistent');
     assert.equal(options.env.GH_CONFIG_DIR, '/nonexistent');
     assert.equal(options.env.GH_TOKEN, undefined);
+    assert.equal(options.timeout, runtimeArchiveVerificationTimeout((await stat(f.archive)).size));
     assert.equal(cli, 'gh');
     assert.deepEqual(args.slice(0, 2), ['attestation', 'verify']);
     assert.notEqual(args[2], f.archive);
@@ -99,6 +112,61 @@ test('real verifier failure prevents extraction; invocation pins source and iden
     throw Error('No real attestation available');
   } }), /No real attestation/);
   await assert.rejects(stat(f.output), { code: 'ENOENT' });
+});
+
+test('large sparse archive gets its size-derived native budget; timeout prevents extraction', async t => {
+  const f = await fixture(t);
+  // Extending creates a hole, avoiding a material write of the published 1.4 GB asset.
+  const bytes = 32 * 1024 * 1024 + 512;
+  await truncate(f.archive, bytes);
+  let snapshot;
+  const timeout = Object.assign(Error('verification expired'), { code: 'ETIMEDOUT' });
+  await assert.rejects(verifyAndUnpackRuntimeArchive(f.archive, f.output, manifest(), { run: async (_cli, args, options) => {
+    snapshot = args[2];
+    assert.notEqual(snapshot, f.archive);
+    assert.equal((await stat(snapshot)).size, bytes);
+    assert.equal(options.timeout, 33000);
+    throw timeout;
+  } }), error => error === timeout);
+  await assert.rejects(stat(f.output), { code: 'ENOENT' });
+  await assert.rejects(stat(dirname(snapshot)), { code: 'ENOENT' });
+  assert.equal((await stat(f.archive)).size, bytes);
+});
+
+test('extended verification budget never admits an oversized archive', async t => {
+  const f = await fixture(t);
+  await truncate(f.archive, MAX_RUNTIME_ARCHIVE_BYTES + 1);
+  await assert.rejects(verifyAndUnpackRuntimeArchive(f.archive, f.output, manifest(), {
+    run: async () => assert.fail('oversized archive must not reach native verification'),
+  }), /Invalid release archive size/);
+  await assert.rejects(stat(f.output), { code: 'ENOENT' });
+});
+
+test('native success still requires the pinned certificate before extraction', async t => {
+  const f = await fixture(t);
+  for (const certificate of [
+    { sourceRepositoryIdentifier: '1', sourceRepositoryRef: 'refs/heads/main' },
+    { sourceRepositoryIdentifier: '1450999885', sourceRepositoryRef: 'refs/heads/other' },
+  ]) {
+    await assert.rejects(verifyAndUnpackRuntimeArchive(f.archive, f.output, manifest(), {
+      run: async () => ({ stdout: JSON.stringify([{ verificationResult: { signature: { certificate } } }]) }),
+    }), /Release archive provenance unavailable/);
+    await assert.rejects(stat(f.output), { code: 'ENOENT' });
+  }
+});
+
+test('verified snapshot extracts authenticated bytes even when the original changes', async t => {
+  const f = await fixture(t);
+  await verifyAndUnpackRuntimeArchive(f.archive, f.output, manifest(), { run: async (_cli, args) => {
+    assert.deepEqual(await readFile(args[2]), await readFile(f.archive));
+    await writeFile(f.archive, 'changed original');
+    return { stdout: JSON.stringify([{ verificationResult: { signature: { certificate: {
+      sourceRepositoryIdentifier: '1450999885', sourceRepositoryRef: 'refs/heads/main',
+    } } } }]) };
+  } });
+  assert.deepEqual(await readdir(f.output), [hash]);
+  assert.deepEqual(await readFile(join(f.output, hash)), contents);
+  assert.equal((await stat(join(f.output, hash))).mode & 0o777, 0o400);
 });
 
 test('release packaging CLI carries source/base/companion identity into the checked assets', async t => {

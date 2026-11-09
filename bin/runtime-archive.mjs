@@ -13,6 +13,13 @@ export const MAX_RUNTIME_ARCHIVE_BYTES = 1_900_000_000;
 const hashName = /^[a-f0-9]{64}$/;
 const zero = bytes => bytes.every(byte => byte === 0);
 
+export function runtimeArchiveVerificationTimeout(bytes) {
+  if (!Number.isSafeInteger(bytes) || bytes <= 0) throw Error('Invalid release archive size');
+  // Native verification hashes the whole archive; allow one second per 16 MiB
+  // in addition to startup, with a fixed ceiling independent of release input.
+  return Math.min(180000, 30000 + Math.ceil(bytes / (16 * 1024 * 1024)) * 1000);
+}
+
 function expectedBlobs(manifest) {
   validateManifest(manifest);
   const expected = new Map();
@@ -131,10 +138,12 @@ export async function verifyAndUnpackRuntimeArchive(archive, output, manifest, {
     const bundleSnapshot = await snapshotAttestation(bundleFile, scratch);
     const snapshot = join(scratch, 'runtime-blobs.tar');
     await copyFile(archive, snapshot, constants.COPYFILE_EXCL);
+    const snapshotInfo = await lstat(snapshot);
+    if (!snapshotInfo.isFile() || snapshotInfo.nlink !== 1 || snapshotInfo.size !== info.size) throw Error('Release archive changed during snapshot');
     const { stdout } = await run(cli, ['attestation', 'verify', snapshot, '--bundle', bundleSnapshot, '-R', 'briq-cloud/t3-cloud',
       '--signer-workflow', 'briq-cloud/t3-cloud/.github/workflows/image.yml',
       '--source-ref', 'refs/heads/main', '--source-digest', manifest.source, '--format', 'json'],
-    { timeout: 30000, maxBuffer: 1_000_000, env: attestationEnvironment(scratch) });
+    { timeout: runtimeArchiveVerificationTimeout(snapshotInfo.size), maxBuffer: 1_000_000, env: attestationEnvironment(scratch) });
     const rows = JSON.parse(stdout);
     if (!Array.isArray(rows) || !rows.some(row => {
       const certificate = row?.verificationResult?.signature?.certificate;

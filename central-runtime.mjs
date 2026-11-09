@@ -241,6 +241,9 @@ export async function createCentralRuntime(env = process.env, dependencies = {})
     async function updateActivity() {
       // Existing broker ownership and durable ledgers are authoritative. An
       // unresolved marker is busy even if no process or client is connected.
+      // Durable reads are asynchronous snapshots. Any admitted receive that
+      // starts or settles during this scan invalidates its quiescence proof.
+      const activityGeneration = broker.activityGeneration;
       let unresolved = 0;
       for (const binding of [...await store.list(), ...await store.listSources()]) {
         if (binding.restoreState || ['unknown', 'started'].includes(binding.nativeState) ||
@@ -254,7 +257,7 @@ export async function createCentralRuntime(env = process.env, dependencies = {})
         unresolved += (await store.listOperations(binding.threadId)).filter(row =>
           row.method === 'briq/scoped' ? row.state !== 'completed' : row.state !== 'adopted').length;
       }
-      const counts = { receiving: broker.inflightReceives, activeTurns: broker.activeTurns.size, pendingTurns: broker.pendingTurns.size,
+      const counts = { receiving: broker.inflightReceives, activityChanged: Number(activityGeneration !== broker.activityGeneration), activeTurns: broker.activeTurns.size, pendingTurns: broker.pendingTurns.size,
         mutations: broker.mutations.size, logins: broker.loginPending.size, approvals: broker.approvals.size, serialized: store.active.size,
         claude: Number(Boolean(claude.owner || claude.metadataOwner)), unresolved,
         preparations: bridgeLeases.size, restoring: Number(Boolean(restoring)), unavailable: Number(broker.unavailable) };

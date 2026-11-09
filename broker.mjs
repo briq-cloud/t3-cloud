@@ -157,7 +157,7 @@ function textInput(input) {
 export class CapabilityBroker {
   constructor({ store, app, claude, briqTransport, admittedProviders = ['codex'] }) {
     this.admittedProviders = new Set(admittedProviders.map(providerInstanceId));
-    Object.assign(this, { store, app, claude, briqTransport }); this.sessions = new Set(); this.approvals = new Map(); this.sequence = 0; this.registered = new Set(); this.activeTurns = new Map(); this.finishedTurns = new Map(); this.unavailable = false; this.mutations = new Map(); this.owners = new Map(); this.pendingTurns = new Map(); this.questionTurns = new Map(); this.seenQuestions = new Set(); this.loginPending = new Set(); this.inflightReceives = 0;
+    Object.assign(this, { store, app, claude, briqTransport }); this.sessions = new Set(); this.approvals = new Map(); this.sequence = 0; this.registered = new Set(); this.activeTurns = new Map(); this.finishedTurns = new Map(); this.unavailable = false; this.mutations = new Map(); this.owners = new Map(); this.pendingTurns = new Map(); this.questionTurns = new Map(); this.seenQuestions = new Set(); this.loginPending = new Set(); this.inflightReceives = 0; this.activityGeneration = 0;
     app.events.on('message', message => {
       if (message.method === 'account/login/completed' && typeof message.params?.loginId === 'string') this.loginPending.delete(message.params.loginId);
       this.deliver(message).catch(() => {});
@@ -397,7 +397,7 @@ export class CapabilityBroker {
     const id = message.id; let mutation;
     // Admission is counted before the first await, including capability lookups
     // and nested operation dispatch, until all effects and replies settle.
-    this.inflightReceives++;
+    this.inflightReceives++; this.activityGeneration++;
     try {
       if (this.draining && ['thread/start', 'thread/resume', 'turn/start', 'turn/steer',
           'briq/operation/execute', 'claude/allocate', 'claude/open', 'claude/offer', 'claude/model'].includes(message.method))
@@ -569,7 +569,7 @@ export class CapabilityBroker {
         }
       }
       if (!session.closed) await session.send(pending ? error(id, 'Sandbox operation outcome requires reconciliation', true) : error(id));
-    } finally { this.inflightReceives--; }
+    } finally { this.inflightReceives--; this.activityGeneration++; }
   }
   publicResult(value) {
     if (Array.isArray(value)) return value.map(item => this.publicResult(item));

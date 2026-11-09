@@ -351,3 +351,42 @@ for (const wrapped of [false, true]) test(`update drain counts ${wrapped ? 'scop
  await session.receive({id:3,method:'thread/read',params:{threadId:'native'}});
  assert.equal(runtime.broker.inflightReceives,0);assert.equal((await runtime.updateActivity()).idle,true);
 });
+
+test('authenticated turn settling during a later durable idle read invalidates the scan and retains unknown outcome', async t => {
+ const f=await fixture(t);const createTransport=f.deps.createScopedMcpTransport;
+ const runtime=await createCentralRuntime(f.env,{...f.deps,createScopedMcpTransport:()=>({...createTransport(),reserveTurn:()=>undefined})});f.runtimes.push(runtime);await runtime.restore();
+ const store=runtime.broker.store;
+ await store.save({ownerId:'owner',state:'ready',threadId:'a-held',allocationId:'allocation',bridgeToken:'held-bridge',nativeThreadId:'native',nativeModel:'mock',execEnvironmentId:'exec',execUrl:'wss://child.example/_cloud/exec',execToken:'capability'});
+ await store.save({ownerId:'owner',state:'ready',threadId:'z-later',allocationId:'later-allocation',bridgeToken:'later-bridge',nativeModel:'mock',execEnvironmentId:'later-exec',execUrl:'wss://child.example/_cloud/exec',execToken:'later-capability'});
+ const received=[];const session=await runtime.broker.connect('held-bridge',value=>received.push(value),()=>{});
+ await session.receive({id:0,method:'initialize'});
+ let releaseCapabilities,capabilitiesEntered;const capabilitiesWaiting=new Promise(resolve=>{capabilitiesEntered=resolve;});
+ const original=f.app.request;let hold=true,nativeCalls=0;
+ f.app.request=async(method,params)=>{
+  if(method==='account/read'&&hold){hold=false;capabilitiesEntered();await new Promise(resolve=>{releaseCapabilities=resolve;});}
+  if(method==='turn/start'){nativeCalls++;throw Error('Native outcome unknown');}
+  return original(method,params);
+ };
+ const admitted=session.receive({id:1,method:'turn/start',params:{threadId:'native',input:[{type:'text',text:'authenticated held turn'}]}});
+ await capabilitiesWaiting;runtime.drain();
+ // Scan reads detached bindings and the held thread's empty markers first,
+ // then pauses on a different binding while that admitted turn finishes.
+ const list=store.list.bind(store);store.list=async()=>(await list()).sort((a,b)=>a.threadId.localeCompare(b.threadId));
+ const markers=store.mutationMarkers.bind(store);let releaseScan,scanEntered,heldMarkers;
+ const scanWaiting=new Promise(resolve=>{scanEntered=resolve;});let pause=true;
+ store.mutationMarkers=async threadId=>{
+  const values=await markers(threadId);
+  if(threadId==='a-held'&&pause)heldMarkers=values;
+  if(threadId==='z-later'&&pause){pause=false;scanEntered();await new Promise(resolve=>{releaseScan=resolve;});}
+  return values;
+ };
+ const scanning=runtime.updateActivity();await scanWaiting;assert.deepEqual(heldMarkers,[]);
+ releaseCapabilities();await admitted;
+ assert.equal(nativeCalls,1);assert.ok(received.at(-1).error);
+ assert.equal(runtime.broker.inflightReceives,0);assert.equal(runtime.broker.mutations.size,0);assert.equal(runtime.broker.pendingTurns.size,0);assert.equal(store.active.size,0);
+ assert.equal((await store.load('a-held')).turnState,'unknown');assert.equal((await markers('a-held')).length,1);
+ releaseScan();const result=await scanning;
+ assert.equal(result.counts.receiving,0);assert.equal(result.counts.unresolved,0);assert.equal(result.counts.activityChanged,1);assert.equal(result.idle,false);
+ assert.equal(Object.entries(result.counts).filter(([key])=>key!=='activityChanged').every(([,value])=>value===0),true);
+ const next=await runtime.updateActivity();assert.equal(next.counts.activityChanged,0);assert.ok(next.counts.unresolved>=1);assert.equal(next.idle,false);
+});

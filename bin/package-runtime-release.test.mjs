@@ -150,3 +150,30 @@ test('image normalization fails closed when a declared root is missing', async t
     assert.equal(error.code, 1); assert.equal(error.stdout, ''); assert.equal(error.stderr, 'Runtime image normalization failed: stage=copy\n'); return true;
   });
 });
+
+
+test('tar-exported hardlinks normalize into a packable snapshot without changing the checked source or excluded alias', async t => {
+  const f = await imageFixture(t), sourceFile = join(f.root, 'opt/t3/node');
+  const sibling = join(f.root, 'opt/t3/export-alias'), outside = join(f.root, 'work/preserved-alias');
+  await mkdir(dirname(outside), { mode: 0o700 }); await link(sourceFile, sibling); await link(sourceFile, outside);
+  await symlink('node', join(f.root, 'opt/t3/node-link'));
+  const sourceBefore = await lstat(sourceFile), sourceBytes = await readFile(sourceFile);
+  const archive = `${f.output}.export.tar`, exported = `${f.root}-exported`; await mkdir(exported, { mode: 0o700 });
+  await run('tar', ['-cf', archive, '-C', f.root, '.']);
+  const archiveBytes = await readFile(archive);
+  await run('tar', ['-xf', archive, '-C', exported]);
+  const exportedSource = join(exported, 'opt/t3/node'), exportedOutside = join(exported, 'work/preserved-alias');
+  const outsideBefore = await lstat(exportedOutside), exportedBefore = await lstat(exportedSource);
+  assert.equal(exportedBefore.nlink, 3); assert.equal(exportedBefore.ino, outsideBefore.ino);
+  assert.deepEqual(await packageRuntimeRelease({ ...f, root: exported, output: `${f.output}-raw-export` }), { stage: 'inventory', category: 'hardlink' });
+  await run('bash', [new URL('./normalize-runtime-image', import.meta.url).pathname, exported]);
+  assert.equal((await lstat(exportedSource)).nlink, 1); assert.equal((await lstat(join(exported, 'opt/t3/export-alias'))).nlink, 1);
+  assert.equal((await lstat(exportedSource)).mode, exportedBefore.mode); assert.deepEqual(await readFile(exportedSource), sourceBytes);
+  assert.equal(await readlink(join(exported, 'opt/t3/node-link')), 'node');
+  assert.equal((await lstat(exportedOutside)).ino, outsideBefore.ino); assert.equal((await lstat(exportedOutside)).mode, outsideBefore.mode);
+  assert.deepEqual(await readFile(exportedOutside), sourceBytes);
+  assert.equal((await lstat(sourceFile)).ino, sourceBefore.ino); assert.equal((await lstat(sourceFile)).nlink, sourceBefore.nlink);
+  assert.deepEqual(await readFile(sourceFile), sourceBytes); assert.deepEqual(await readFile(archive), archiveBytes);
+  assert.equal(await packageRuntimeRelease({ ...f, root: exported }), null);
+  await run(process.execPath, [new URL('./check-runtime-release.mjs', import.meta.url).pathname, f.output]);
+});

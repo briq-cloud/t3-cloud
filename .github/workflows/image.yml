@@ -156,6 +156,8 @@ jobs:
           image_id="$(docker create "$T3_IMAGE:$TAG")"
           trap 'docker rm -v "$image_id" > /dev/null' EXIT
           docker export "$image_id" | tar -xf - -C "$root"
+          # Normalize the exported snapshot without changing the checked image.
+          bash bin/normalize-runtime-image "$root"
           # An unattested PR artifact exercises inventory/archive conformance only.
           # The published bundle is repacked with the final registry digest below.
           node bin/package-runtime-release.mjs "$root" "$RUNNER_TEMP/runtime-candidate" "${BASE##*@}" "$SOURCE" "$T3_IMAGE@sha256:$(printf '%064d' 0)"
@@ -253,6 +255,8 @@ jobs:
           image_id="$(docker create "$CHECKED_IMAGE_ID")"
           trap 'docker rm -v "$image_id" > /dev/null' EXIT
           docker export "$image_id" | tar -xf - -C "$root"
+          # Normalize the exported snapshot without changing the checked image.
+          bash bin/normalize-runtime-image "$root"
           node bin/package-runtime-release.mjs "$root" "$RUNNER_TEMP/runtime-release" "${BASE##*@}" "$SOURCE" "$T3_IMAGE@$DIGEST"
           node bin/check-runtime-release.mjs "$RUNNER_TEMP/runtime-release"
       - name: Attest exact runtime assets

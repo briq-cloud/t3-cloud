@@ -158,9 +158,9 @@ restart, stale loader lock or failed new runtime stays closed for explicit
 reconciliation. The loader never kills a persisted PID, replays a native turn,
 or automatically rolls back after a possible state migration.
 
-This is a local lifecycle candidate. Authenticated update discovery, downloading,
-manual/automatic update controls and recovery UI still need integration. Installing
-the bootstrap into an existing home and proving it survives real sandbox cold
-boots are incomplete. No production or staging rollout, official-phone update,
+This local candidate includes owner-authenticated update discovery and download,
+manual and opt-in automatic updates, explicit recovery controls, and a release-owned
+controller. Installing the bootstrap into an existing home and proving it survives
+real sandbox cold boots are incomplete. No production or staging rollout, official-phone update,
 GitHub attestation verification against a published release, or end-to-end cloud
 activation has been qualified by these tests.

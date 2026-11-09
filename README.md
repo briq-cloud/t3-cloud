@@ -1,4 +1,15 @@
-# T3 Cloud connections
+# T3 Cloud
+
+This repository builds the standalone `ghcr.io/briq-cloud/t3-cloud` image. The
+Dockerfile uses the pinned T3 source, runtime versions, and locked dependencies in
+this repository. Pull requests run runtime tests and offline image checks; an
+explicitly dispatched release publishes an immutable date tag and `latest`.
+
+Build locally with `docker build --platform linux/amd64 -t t3-cloud:local .` and run the runtime checks
+with `npm ci --ignore-scripts && npm test`. The image build fetches the pinned
+upstream source and verified release artifacts.
+
+## Connections
 
 The public listener serves native T3 at `/` and owner connection management at `/_cloud/`.
 Native T3 retains its own authentication. The manager uses a separate owner key and an opaque,
@@ -81,23 +92,24 @@ never automatic replay. Revocation invalidates capabilities and durably records 
 failed descendant cleanup still attempts the exact workspace stop. Recovery checks unresolved
 outcomes without replaying a stop.
 
-The credential-free offline image fixture checks Claude fake-provider/fake-CLI scenarios
-and native Codex MCP start, resume and bounded turns against a local fake Responses provider.
-It uses no credentials or real model network; image CI is a required release gate.
-It does not qualify cloud resources, subscription authentication, remote workspace composition
-or deployment. Those acceptance and recovery gates remain required before enablement.
+The credential-free image checks verify central startup, installed Codex version and
+configuration, Claude tool policy with fake provider/CLI inputs, and native Codex MCP
+start, resume and bounded turns against a local fake Responses provider. The Codex
+fixture uses the native app-server and scoped transport, but not the full broker
+ledger. These offline checks do not qualify cloud resources, subscription
+authentication, remote workspaces, deployment or recovery.
 
 Vendor sign-in runs the installed CLI, preserves its existing credential home, and exposes only
 its sign-in URL, device code, and state. The person approves in their own browser. Status comes
 from vendor status commands; no token files are read. The vendor helper is a narrow extraction
-of the existing Agent Home sign-in/status code, without its application or routing runtime.
+of the sign-in/status helper, without an application or routing runtime.
 
 The image installs exact locked dependencies, including `ws` 8.22.0, MCP SDK 1.29.0 and
 Zod 4.6.5, with production-only `npm ci` and lifecycle scripts disabled. Local `node_modules` are excluded from its build
 context. Manager, child and transport processes use the source-pinned Node 26.12.1 runtime;
 the image also checks that `/bin/bash` is available for child execution.
 
-Run the bounded manager contract tests with `node --test --test-timeout=20000 t3-cloud/manager.test.mjs`.
+Run the bounded manager contract tests with `node --test --test-timeout=20000 manager.test.mjs`.
 They use fake adapters and real loopback HTTP/WebSocket services; they do not qualify the broker,
 a provider login, the image, or cloud allocation.
 

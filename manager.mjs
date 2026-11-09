@@ -160,8 +160,9 @@ export function createCloudManager({ role, publicOrigin, ownerKey, ownerId, allo
       if (runtimeUpdates && url.pathname === '/_cloud/updates/status' && req.method === 'GET') return json(res, 200, await runtimeUpdates.status());
       if (runtimeUpdates && url.pathname === '/_cloud/updates/reconcile' && req.method === 'POST') {
         const input = await body(req);
-        if (!only(input, ['action', 'expectedJournalRevision', 'expectedOwnershipRevision']) ||
-            input.action !== 'recover-known-current' || !Number.isSafeInteger(input.expectedJournalRevision) || input.expectedJournalRevision < 0 ||
+        if (!(input.action === 'recover-known-current' ? only(input, ['action', 'expectedJournalRevision', 'expectedOwnershipRevision']) :
+            input.action === 'recover-bootstrap-migration' && only(input, ['action', 'expectedJournalRevision', 'expectedOwnershipRevision', 'expectedMigrationId', 'expectedMigrationRevision']) &&
+            /^[a-f0-9-]{36}$/.test(input.expectedMigrationId ?? '') && Number.isSafeInteger(input.expectedMigrationRevision) && input.expectedMigrationRevision > 0) || !Number.isSafeInteger(input.expectedJournalRevision) || input.expectedJournalRevision < 0 ||
             !/^[a-f0-9]{64}$/.test(input.expectedOwnershipRevision ?? '') || typeof runtimeUpdates.reconcile !== 'function')
           return json(res, 400, { error: 'Invalid recovery operation' });
         return json(res, 200, await runtimeUpdates.reconcile(input));

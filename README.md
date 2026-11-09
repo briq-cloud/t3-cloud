@@ -164,3 +164,34 @@ controller. Installing the bootstrap into an existing home and proving it surviv
 real sandbox cold boots are incomplete. No production or staging rollout, official-phone update,
 GitHub attestation verification against a published release, or end-to-end cloud
 activation has been qualified by these tests.
+
+### Initial bootstrap migration
+
+An existing home that predates the loader requires a one-time image replacement.
+The application helper only prepares durable evidence; it does not replace an
+image or install files into the root filesystem.
+
+Before stopping the old runtime, place a published runtime manifest, its
+`runtime-attestation.jsonl`, and content-addressed `blobs/` under the fixed
+`$T3_CLOUD_STATE/updates/bootstrap-input/` directory. Run
+`node bin/prepare-bootstrap-migration.mjs` with the existing protected
+`T3_CLOUD_OWNER_ID` and `T3_CLOUD_CHILD_IMAGE` deployment values and the pinned
+target `T3_CLOUD_BOOTSTRAP_BASE_IMAGE` digest. The helper accepts no arguments,
+verifies the publisher attestation and staged bytes, and refuses existing loader
+or activation history. It inventories only the two legacy lock directories;
+login, pairing and native session files are never read.
+
+After image replacement, refresh the deployment's `T3_CLOUD_CHILD_IMAGE` to the
+actual replacement digest. Keep the same durable home and owner binding. The new
+loader serves only the owner management page until the owner explicitly chooses
+**Install prepared runtime and quarantine old bindings**. Recovery requires a
+changed kernel boot, matching replacement image/source/base, unchanged legacy
+evidence, and the exact prepared runtime. Legacy lock directories are renamed
+into migration evidence, never deleted. The selected release becomes the initial
+installation with no fabricated activation receipt. Existing bindings remain
+quarantined; recovery never replays native work, signs in or pairs a device.
+
+If recovery fails, preserve the receipt, activation journal and evidence.
+Unknown process outcomes keep admission closed. A subsequent changed boot can
+resume the same migration operation; contradictory history requires inspection.
+Local tests do not qualify an existing home's filesystem or phone continuity.

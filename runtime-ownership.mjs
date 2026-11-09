@@ -44,7 +44,7 @@ export async function kernelLock(file, { spawnProcess = spawn, binary = '/usr/bi
 }
 
 export async function acquireRuntimeOwnership({ directory, name, environmentBinding, legacy,
-  identity = linuxIdentity, lock = kernelLock }) {
+  identity = linuxIdentity, lock = kernelLock, deferClaim = false }) {
   if (!['loader', 'central'].includes(name)) throw Error('Invalid ownership role');
   await mkdir(directory, { recursive: true, mode: 0o700 });
   const lease = await lock(join(directory, `${name}.ownership.lock`));
@@ -72,12 +72,27 @@ export async function acquireRuntimeOwnership({ directory, name, environmentBind
     let record = previous;
     const claim = async () => {
       if (!['fresh', 'clean', 'cold'].includes(evidence)) throw Error('Ownership requires reconciliation');
-      record = { protocol: 1, generation: randomUUID(), environmentBinding, ...local, state: 'active' };
+      record = { protocol: 1, generation: randomUUID(), environmentBinding, ...local, state: 'active',
+        ...(valid && previous.environmentBinding === environmentBinding && /^[a-f0-9-]{36}$/.test(previous.initialBootstrapMigration ?? '') ? { initialBootstrapMigration: previous.initialBootstrapMigration } : {}) };
       await durableJson(file, record); claimed = true;
     };
-    if (['fresh', 'clean'].includes(evidence)) await claim();
+    if (!deferClaim && ['fresh', 'clean'].includes(evidence)) await claim();
     let closed = false;
     return { evidence, get revision() { return ownershipRevision({ record, original, malformed, legacyExists, evidence }); },
+      async claimBootstrap({ id, preparationBootId, expectedRevision }) {
+        // Only the separate owner migration operation may invoke this claim.
+        // It must never change ordinary unknown/cold classification globally.
+        if (expectedRevision !== this.revision || !local || !bindingValid(environmentBinding) ||
+            local.bootId === preparationBootId || malformed || !/^[a-f0-9-]{36}$/.test(id ?? '') ||
+            previous && (!valid || previous.environmentBinding !== environmentBinding || previous.initialBootstrapMigration !== id ||
+              previous.bootId === local.bootId && previous.state !== 'clean')) throw Error('Initial ownership unresolved');
+        if (legacy) { try { await stat(legacy); throw Error('Legacy ownership not quarantined'); } catch (error) { if (error.code !== 'ENOENT') throw error; } }
+        let disk = null;
+        try { disk = await readFile(file, 'utf8'); } catch (error) { if (error.code !== 'ENOENT') throw error; }
+        if (disk !== original) throw Error('Ownership record changed');
+        record = { protocol: 1, generation: randomUUID(), environmentBinding, ...local, state: 'active', initialBootstrapMigration: id };
+        await durableJson(file, record); claimed = true;
+      },
       async reconcile(expectedRevision) {
         if (expectedRevision !== this.revision || evidence !== 'cold') throw Error('Ownership evidence changed or unresolved');
         if (await readFile(file, 'utf8') !== original) throw Error('Ownership record changed');

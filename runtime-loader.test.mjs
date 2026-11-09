@@ -9,6 +9,8 @@ import { join } from 'node:path';
 import { acquireRuntimeOwnership } from './runtime-ownership.mjs';
 import { testIdentity, testLock, testOwnership } from './fixtures/runtime-ownership.mjs';
 import { startLoader } from './runtime-loader.mjs';
+import { prepareBootstrapMigration, recoverBootstrapMigration } from './runtime-bootstrap-migration.mjs';
+import { createHash } from 'node:crypto';
 import { runtimeProcess } from './runtime-process.mjs';
 import { runtimeControllerProcess } from './runtime-controller-process.mjs';
 import { RuntimeSupervisor } from './runtime-supervisor.mjs';
@@ -23,7 +25,7 @@ async function unusedPort() {
   const server = createServer(); server.listen(0, '127.0.0.1'); await once(server, 'listening');
   const port = server.address().port; await new Promise(resolve => server.close(resolve)); return port;
 }
-async function fixture(t, { recovery = false, unknown = false, journal, ownershipEvidence, releaseController = false, expectedCloseFailure = false } = {}) {
+async function fixture(t, { recovery = false, unknown = false, journal, ownershipEvidence, bootstrapMigration = false, releaseController = false, expectedCloseFailure = false } = {}) {
   const state = await mkdtemp(join(tmpdir(), 't3-loader-integration-'));
   let loader;
   t.after(async () => {
@@ -84,15 +86,25 @@ async function fixture(t, { recovery = false, unknown = false, journal, ownershi
         return updates;
       } });`);
   }
+  const childImage = `ghcr.io/briq-cloud/t3-cloud@sha256:${'e'.repeat(64)}`;
+  const manifest = { source, childImage, files: [{ path: 'opt/t3-cloud/runtime-recovery.json', type: 'file', sha256: createHash('sha256').update('{"protocol":1,"persistedBindings":"quarantine"}\n').digest('hex') }] };
+  const migratedOwnership = options => acquireRuntimeOwnership({ ...options, lock: testLock, identity: async () => ({ ...testIdentity, bootId: '22222222-2222-2222-2222-222222222222' }) });
+  if (bootstrapMigration) {
+    const { mkdir } = await import('node:fs/promises'); await mkdir(join(state, 'central.lock'));
+    await writeFile(sourceFile, source);
+    await prepareBootstrapMigration({ T3_CLOUD_STATE: state, T3_CLOUD_OWNER_ID: 'owner', T3_CLOUD_CHILD_IMAGE: `ghcr.io/briq-cloud/t3-cloud@sha256:${'f'.repeat(64)}`, T3_CLOUD_BOOTSTRAP_BASE_IMAGE: `sha256:${'c'.repeat(64)}` }, {
+      identity: async () => testIdentity, stage: async () => ({ identity, path: '/staged-fixture' }), verify: async () => ({ ...manifest, baseImage: `sha256:${'c'.repeat(64)}` }) });
+  }
   let starts = 0, updateWork, controllerWork, controllerTerminal; const recoveries = [], controllers = [];
   const port = await unusedPort();
   loader = await startLoader({ PORT: String(port), T3_HOST: '127.0.0.1', T3_CWD: state, T3_CLOUD_STATE: state,
-    T3_CLOUD_PUBLIC_ORIGIN: origin, T3_CLOUD_OWNER_KEY: key, T3_CLOUD_OWNER_ID: 'owner' }, {
-    baseImageFile, sourceFile, acquireOwnership: ownershipEvidence ? options => acquireRuntimeOwnership({ ...options, lock: testLock, identity: async () => ({ ...testIdentity, ...(ownershipEvidence === 'cold' ? { bootId: '22222222-2222-2222-2222-222222222222' } : {}) }) }) : testOwnership,
+    T3_CLOUD_PUBLIC_ORIGIN: origin, T3_CLOUD_OWNER_KEY: key, T3_CLOUD_OWNER_ID: 'owner', T3_CLOUD_CHILD_IMAGE: childImage }, {
+    baseImageFile, sourceFile, acquireOwnership: bootstrapMigration ? migratedOwnership : ownershipEvidence ? options => acquireRuntimeOwnership({ ...options, lock: testLock, identity: async () => ({ ...testIdentity, ...(ownershipEvidence === 'cold' ? { bootId: '22222222-2222-2222-2222-222222222222' } : {}) }) }) : testOwnership,
+    recoverMigration: options => recoverBootstrapMigration({ ...options, identity: async () => ({ ...testIdentity, bootId: '22222222-2222-2222-2222-222222222222' }), acquireOwnership: migratedOwnership }),
     createDriver: env => runtimeProcess(env, { spawnProcess: (_command, _args, options) => {
       starts++; recoveries.push(options.env.T3_CLOUD_RECOVERY); return spawn(process.execPath, [childFile], options);
     } }),
-    createSupervisor: options => new RuntimeSupervisor({ ...options, verify: async () => ({ source }), stage: async () => ({ identity }) }),
+    createSupervisor: options => new RuntimeSupervisor({ ...options, verify: async () => manifest, stage: async () => ({ identity }) }),
     createUpdates: options => {
       controllerTerminal = options.onTerminal;
       if (releaseController) {
@@ -261,4 +273,26 @@ test('failed controller replacement fences established sockets and retains recov
   assert.equal(f.loader.supervisor.journal.phase, 'recovery-required');
   assert.equal((await f.send('/native')).status, 503);
   assert.equal(f.loader.supervisor.driver.alive, true);
+});
+
+
+test('prepared bootstrap migration stays management-only until owner action crosses authenticated HTTP and owned health', async t => {
+  const f = await fixture(t, { bootstrapMigration: true });
+  assert.equal(f.starts(), 0);
+  assert.equal((await f.send('/native')).status, 503);
+  assert.equal((await f.send('/_cloud/threads', { method: 'POST', input: { threadId: 'old' } })).status, 503);
+  const status = (await f.send('/_cloud/updates/status')).value;
+  const input = { action: 'recover-bootstrap-migration', expectedMigrationId: status.recovery.migration.id,
+    expectedMigrationRevision: status.recovery.migration.revision, expectedJournalRevision: status.recovery.journalRevision,
+    expectedOwnershipRevision: status.recovery.ownershipRevision };
+  assert.equal((await f.send('/_cloud/updates/reconcile', { method: 'POST', input, auth: false })).status, 401);
+  assert.equal((await f.send('/_cloud/updates/reconcile', { method: 'POST', input, requestOrigin: 'https://evil.example' })).status, 403);
+  assert.equal((await f.send('/_cloud/updates/reconcile', { method: 'POST', input: { ...input, destination: '/tmp/untrusted' } })).status, 400);
+  assert.equal(f.starts(), 0);
+  const response = await f.send('/_cloud/updates/reconcile', { method: 'POST', input });
+  assert.equal(response.status, 200); assert.equal(f.starts(), 1); assert.deepEqual(f.recoveries, ['1']);
+  const journal = f.loader.supervisor.journal;
+  assert.equal(journal.current, identity); assert.equal(journal.receipt, null); assert.ok(journal.initialInstall);
+  const receipt = JSON.parse(await readFile(join(f.state, 'updates/bootstrap-migration.json'), 'utf8'));
+  assert.equal(receipt.phase, 'completed'); assert.equal(f.loader.supervisor.admitting, true);
 });

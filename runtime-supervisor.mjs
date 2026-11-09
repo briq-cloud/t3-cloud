@@ -47,7 +47,7 @@ export class RuntimeSupervisor {
       return this.verify(this.releaseRoot(value), value, this.baseImage);
     }
   }
-  async initialize({ ownership } = {}) {
+  async initialize({ ownership, bootstrapMigration = false, initialMigrationReceipt = null } = {}) {
     this.ownership = ownership;
     await mkdir(join(this.state, 'updates'), { recursive: true, mode: 0o700 });
     try { this.journal = JSON.parse(await readFile(this.file, 'utf8')); }
@@ -57,6 +57,7 @@ export class RuntimeSupervisor {
         return { recoveryRequired: true };
       }
       this.journal = { protocol: 1, current: 'bootstrap', staged: null, desired: null, phase: 'stopped', receipt: null };
+      if (bootstrapMigration) Object.assign(this.journal, { initialMigration: bootstrapMigration, initialJournalGeneration: randomUUID() });
       await this.save({});
     }
     const j = this.journal;
@@ -64,6 +65,7 @@ export class RuntimeSupervisor {
       this.journal = j && typeof j === 'object' ? j : { protocol: 0, phase: 'unavailable', revision: 0 };
       return { recoveryRequired: true };
     }
+    if (bootstrapMigration || j.initialMigration && j.initialMigration !== initialMigrationReceipt) return { recoveryRequired: true };
     // A loader/manager crash can leave provider outcomes ambiguous even when the
     // selected version did not change. No native session is resumed implicitly.
     if (ownership && !['fresh', 'clean'].includes(ownership.evidence) || j.phase !== 'stopped' || j.desired) return { recoveryRequired: true };

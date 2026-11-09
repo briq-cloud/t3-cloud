@@ -7,6 +7,7 @@ import { join } from 'node:path';
 import { RuntimeSupervisor } from './runtime-supervisor.mjs';
 import { runtimeProcess } from './runtime-process.mjs';
 import { runtimeControllerProcess } from './runtime-controller-process.mjs';
+import { readBootstrapMigration, recoverBootstrapMigration } from './runtime-bootstrap-migration.mjs';
 import { acquireRuntimeOwnership } from './runtime-ownership.mjs';
 
 export function loaderFrontdoor({ port, host, target, admitting, managing = () => false }) {
@@ -44,6 +45,7 @@ export function loaderFrontdoor({ port, host, target, admitting, managing = () =
 export async function startLoader(env = process.env, {
   environmentBinding = env.T3_CLOUD_OWNER_ID, acquireOwnership = acquireRuntimeOwnership,
   baseImageFile = '/etc/t3-cloud/base-image', sourceFile = '/etc/t3-cloud/source',
+  readMigration = readBootstrapMigration, recoverMigration = recoverBootstrapMigration,
   createDriver = runtimeProcess, createSupervisor = options => new RuntimeSupervisor(options),
   createUpdates = options => runtimeControllerProcess(options),
   createRecoveryManager = async options => (await import('/opt/t3-cloud/manager.mjs')).createCloudManager(options),
@@ -52,7 +54,10 @@ export async function startLoader(env = process.env, {
   if (!state?.startsWith('/')) throw Error('Absolute durable state required');
   const baseImage = (await readFile(baseImageFile, 'utf8')).trim();
   await mkdir(join(state, 'updates'), { recursive: true, mode: 0o700 });
-  const ownership = await acquireOwnership({ directory: join(state, 'updates'), name: 'loader', environmentBinding, legacy: join(state, 'updates', 'loader.lock') });
+  let migration;
+  try { migration = await readMigration(state); } catch { migration = { phase: 'invalid' }; }
+  const migrationPending = migration && migration.phase !== 'completed';
+  const ownership = await acquireOwnership({ directory: join(state, 'updates'), name: 'loader', environmentBinding, deferClaim: Boolean(migrationPending), legacy: join(state, 'updates', 'loader.lock') });
   const driver = createDriver(env);
   const supervisor = createSupervisor({ state, baseImage, driver });
   let updates, recoveryServer, closing, controllerIdentity, controllerRecovery, controllerFault = false, bootstrapSource = null, transition, updateScheduled = false;
@@ -93,17 +98,23 @@ export async function startLoader(env = process.env, {
   const operations = async (method, enabled) => {
     if (transition) await transition;
     if (!updates || closing) throw Error('Runtime updater unavailable');
-    if (method === 'status') return { ...await updates.status(), recovery: { ownership: ownership.evidence, ownershipRevision: ownership.revision, journalRevision: supervisor.journal.revision ?? 0, bindingsQuarantined: Boolean(supervisor.journal.recovery), required: Boolean(recoveryServer), available: supervisor.recoverable() } };
+    if (method === 'status' && migrationPending && recoveryServer) {
+      try { migration = await readMigration(state) ?? { phase: 'invalid' }; } catch { migration = { phase: 'invalid' }; }
+    }
+    if (method === 'status') return { ...await updates.status(), recovery: { ownership: ownership.evidence, ownershipRevision: ownership.revision, journalRevision: supervisor.journal.revision ?? 0, bindingsQuarantined: Boolean(supervisor.journal.recovery), required: Boolean(recoveryServer), available: migrationPending ? migration.phase !== 'invalid' : supervisor.recoverable(), ...(migrationPending && recoveryServer ? { migration: { id: migration.id, revision: migration.revision } } : {}) } };
     if (method === 'reconcile') {
       if (!recoveryServer || closing) throw Error('Recovery management unavailable');
       // The recovery surface owns 8084; the explicitly recovered manager uses
       // 8082. Close it after the HTTP acknowledgement has been forwarded.
-      await supervisor.reconcile(enabled);
+      if (migrationPending) await recoverMigration({ state, env, source: bootstrapSource, baseImage, supervisor, ownership, input: enabled });
+      else await supervisor.reconcile(enabled);
+      migration = await readMigration(state);
       const prior = recoveryServer; recoveryServer = null;
       setImmediate(() => prior.close());
       await replaceController(controllerRecovery);
       return operations('status');
     }
+    if (migrationPending && recoveryServer) throw Error('Initial bootstrap recovery required');
     if (method === 'check') return updates.check();
     if (method === 'automatic') return updates.setAutomatic(enabled);
     if (method !== 'update') throw Error('Unknown runtime update operation');
@@ -126,7 +137,7 @@ export async function startLoader(env = process.env, {
     port: 8081, host: env.T3_HOST ?? '0.0.0.0', target: 8083, admitting: () => !controllerFault && supervisor.admitting && driver.alive }));
   try {
     for (const listener of listeners) await listener.listen();
-    const status = await supervisor.initialize({ ownership });
+    const status = await supervisor.initialize({ ownership, bootstrapMigration: migrationPending ? migration.id ?? 'invalid' : false, initialMigrationReceipt: migration?.id ?? null });
     try { bootstrapSource = (await readFile(sourceFile, 'utf8')).trim(); } catch (error) { if (error.code !== 'ENOENT') throw error; }
     updates = await createController(Boolean(status.recoveryRequired));
     if (status.recoveryRequired) {

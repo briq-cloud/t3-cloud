@@ -38,7 +38,8 @@ ARG CODEX_SHA256=
 RUN V="${CODEX_VERSION:?Codex requires an explicit version}" \
   && A=codex-package-x86_64-unknown-linux-musl.tar.gz \
   && H="${CODEX_SHA256:-$(gh-digest openai/codex "rust-v${V}" "$A")}" \
-  && curl -fsSL "https://github.com/openai/codex/releases/download/rust-v${V}/$A" -o "/tmp/$A" \
+  && curl -fsSL --retry 3 --retry-delay 2 --retry-max-time 90 --connect-timeout 15 --max-time 180 \
+    "https://github.com/openai/codex/releases/download/rust-v${V}/$A" -o "/tmp/$A" \
   && echo "$H  /tmp/$A" | sha256sum -c - \
   && printf 'Codex\t%s\tthe GitHub release digest\n' "$H" >> /etc/t3-cloud/downloads \
   && mkdir -p /opt/codex && tar -xzf "/tmp/$A" -C /opt/codex && rm "/tmp/$A" \

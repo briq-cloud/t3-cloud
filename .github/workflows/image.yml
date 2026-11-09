@@ -113,17 +113,24 @@ jobs:
           NODE
           # Generated credentials stay in the private env file; never print or inspect it.
           t3_smoke_id="$(docker run -d --network none --env-file "$smoke_env" --name t3-cloud-smoke "$T3_IMAGE:${{ steps.version.outputs.tag }}")"
+          echo 'smoke: readiness'
           for _ in $(seq 1 30); do
             docker exec "$t3_smoke_id" node -e "fetch('http://127.0.0.1:8080/.well-known/t3/environment').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))" && break
             sleep 1
           done
           docker exec "$t3_smoke_id" node -e "fetch('http://127.0.0.1:8080/.well-known/t3/environment').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+          echo 'smoke: capabilities'
           docker exec "$t3_smoke_id" node -e 'const assert=require("node:assert/strict");fetch("http://127.0.0.1:8080/_cloud/capabilities").then(async r=>{assert.equal(r.status,200);assert.deepEqual(await r.json(),{role:"central"})}).catch(()=>process.exit(1))'
-          docker exec "$t3_smoke_id" sh -c 'test -x /bin/bash && test -d /work/.t3-cloud/central.lock && test ! -e /opt/agent-home-runner && test ! -e /opt/dsh && test ! -e /usr/local/bin/briq-agent-acp'
+          echo 'smoke: ownership'
+          docker exec "$t3_smoke_id" node -e 'const assert=require("node:assert/strict"),fs=require("node:fs"),cp=require("node:child_process"),dir="/work/.t3-cloud",owner=JSON.parse(fs.readFileSync(dir+"/central.ownership.json","utf8"));assert.equal(owner.protocol,1);assert.equal(owner.environmentBinding,"ci-smoke-owner");assert.match(owner.generation,/^[a-f0-9-]{36}$/);assert.equal(owner.bootId,fs.readFileSync("/proc/sys/kernel/random/boot_id","utf8").trim());assert.equal(owner.pidNamespace,String(fs.statSync("/proc/self/ns/pid").ino));assert.ok(Number.isSafeInteger(owner.pid)&&owner.pid>0);assert.match(owner.procStartTicks,/^[0-9]+$/);assert.equal(owner.state,"active");const lock=cp.spawnSync("/usr/bin/flock",["--exclusive","--nonblock","--conflict-exit-code","73",dir+"/central.ownership.lock","/bin/true"],{encoding:"utf8"});assert.equal(lock.status,73)'
+          docker exec "$t3_smoke_id" sh -c 'test -x /bin/bash && test ! -e /opt/agent-home-runner && test ! -e /opt/dsh && test ! -e /usr/local/bin/briq-agent-acp'
+          echo 'smoke: versions'
           docker exec "$t3_smoke_id" node -e 'const assert=require("node:assert/strict"),fs=require("node:fs"),cp=require("node:child_process"),version=require("/opt/t3/source.json").codex;assert.equal(cp.execFileSync("codex",["--version"],{encoding:"utf8"}).trim(),`codex-cli ${version}`);assert.equal(fs.readFileSync("/etc/t3-cloud/codex-version","utf8").trim(),version);assert.equal(cp.execFileSync("/opt/t3-cloud/bin/codex-remote",["--version"],{encoding:"utf8"}).trim(),`codex-cli ${version}`);assert.equal(process.versions.node,require("/opt/t3/source.json").node);assert.equal(require("/opt/t3-cloud/node_modules/ws/package.json").version,"8.22.0")'
           # Uses the actual image-pinned native CLIs, without credentials or model calls.
           # A second bootstrap must preserve the definitions accepted during native startup.
+          echo 'smoke: rebootstrap'
           docker exec "$t3_smoke_id" t3-cloud-start true
+          echo 'smoke: config'
           docker exec "$t3_smoke_id" node -e 'const fs=require("node:fs"),assert=require("node:assert/strict");assert.match(fs.readFileSync("/work/.logins/codex/config.toml","utf8"),/bearer_token_env_var = "BRIQ_MCP_TOKEN"/);assert.equal(JSON.parse(fs.readFileSync("/work/.logins/claude/.claude.json","utf8")).mcpServers.briq.headers.Authorization,"Bearer \u0024{BRIQ_MCP_TOKEN}");assert.ok(fs.existsSync("/work/.t3/home/.agents/skills/briq/SKILL.md"));assert.ok(fs.existsSync("/work/.logins/claude/skills/briq/SKILL.md"))'
 
       # The image fixture exercises Claude tool policy and native Codex MCP turns with fake providers.

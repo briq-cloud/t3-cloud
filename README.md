@@ -2,7 +2,7 @@
 
 This repository builds the standalone `ghcr.io/briq-cloud/t3-cloud` image. The
 Dockerfile uses the pinned T3 source, runtime versions, and locked dependencies in
-this repository. Pull requests run runtime tests and offline image checks; a
+this repository. Pull requests run runtime tests and offline image checks; an
 explicitly dispatched release publishes an immutable date tag and `latest`.
 
 Build locally with `docker build --platform linux/amd64 -t t3-cloud:local .` and run the runtime checks
@@ -92,11 +92,12 @@ never automatic replay. Revocation invalidates capabilities and durably records 
 failed descendant cleanup still attempts the exact workspace stop. Recovery checks unresolved
 outcomes without replaying a stop.
 
-The credential-free offline image fixture checks Claude fake-provider/fake-CLI scenarios
-and native Codex MCP start, resume and bounded turns against a local fake Responses provider.
-It uses no credentials or real model network; image CI is a required release gate.
-It does not qualify cloud resources, subscription authentication, remote workspace composition
-or deployment. Those acceptance and recovery gates remain required before enablement.
+The credential-free image checks verify central startup, installed Codex version and
+configuration, Claude tool policy with fake provider/CLI inputs, and native Codex MCP
+start, resume and bounded turns against a local fake Responses provider. The Codex
+fixture uses the native app-server and scoped transport, but not the full broker
+ledger. These offline checks do not qualify cloud resources, subscription
+authentication, remote workspaces, deployment or recovery.
 
 Vendor sign-in runs the installed CLI, preserves its existing credential home, and exposes only
 its sign-in URL, device code, and state. The person approves in their own browser. Status comes

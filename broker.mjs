@@ -157,7 +157,7 @@ function textInput(input) {
 export class CapabilityBroker {
   constructor({ store, app, claude, briqTransport, admittedProviders = ['codex'] }) {
     this.admittedProviders = new Set(admittedProviders.map(providerInstanceId));
-    Object.assign(this, { store, app, claude, briqTransport }); this.sessions = new Set(); this.approvals = new Map(); this.sequence = 0; this.registered = new Set(); this.activeTurns = new Map(); this.finishedTurns = new Map(); this.unavailable = false; this.mutations = new Map(); this.owners = new Map(); this.pendingTurns = new Map(); this.questionTurns = new Map(); this.seenQuestions = new Set(); this.loginPending = new Set();
+    Object.assign(this, { store, app, claude, briqTransport }); this.sessions = new Set(); this.approvals = new Map(); this.sequence = 0; this.registered = new Set(); this.activeTurns = new Map(); this.finishedTurns = new Map(); this.unavailable = false; this.mutations = new Map(); this.owners = new Map(); this.pendingTurns = new Map(); this.questionTurns = new Map(); this.seenQuestions = new Set(); this.loginPending = new Set(); this.inflightReceives = 0;
     app.events.on('message', message => {
       if (message.method === 'account/login/completed' && typeof message.params?.loginId === 'string') this.loginPending.delete(message.params.loginId);
       this.deliver(message).catch(() => {});
@@ -395,11 +395,14 @@ export class CapabilityBroker {
   async receive(session, message, operation) {
     if (!message || typeof message !== 'object' || JSON.stringify(message).length > 2097152) return session.close();
     const id = message.id; let mutation;
+    // Admission is counted before the first await, including capability lookups
+    // and nested operation dispatch, until all effects and replies settle.
+    this.inflightReceives++;
     try {
-      const binding = await this.binding(session);
       if (this.draining && ['thread/start', 'thread/resume', 'turn/start', 'turn/steer',
           'briq/operation/execute', 'claude/allocate', 'claude/open', 'claude/offer', 'claude/model'].includes(message.method))
         throw Error('Runtime is draining for update');
+      const binding = await this.binding(session);
       if (message.method === 'bridge/capabilities') {
         if (!['number', 'string'].includes(typeof id) || message.params !== undefined &&
           (!message.params || typeof message.params !== 'object' || Array.isArray(message.params) || Object.keys(message.params).length)) throw Error('Invalid capability request');
@@ -566,7 +569,7 @@ export class CapabilityBroker {
         }
       }
       if (!session.closed) await session.send(pending ? error(id, 'Sandbox operation outcome requires reconciliation', true) : error(id));
-    }
+    } finally { this.inflightReceives--; }
   }
   publicResult(value) {
     if (Array.isArray(value)) return value.map(item => this.publicResult(item));

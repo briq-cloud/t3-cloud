@@ -254,7 +254,7 @@ export async function createCentralRuntime(env = process.env, dependencies = {})
         unresolved += (await store.listOperations(binding.threadId)).filter(row =>
           row.method === 'briq/scoped' ? row.state !== 'completed' : row.state !== 'adopted').length;
       }
-      const counts = { activeTurns: broker.activeTurns.size, pendingTurns: broker.pendingTurns.size,
+      const counts = { receiving: broker.inflightReceives, activeTurns: broker.activeTurns.size, pendingTurns: broker.pendingTurns.size,
         mutations: broker.mutations.size, logins: broker.loginPending.size, approvals: broker.approvals.size, serialized: store.active.size,
         claude: Number(Boolean(claude.owner || claude.metadataOwner)), unresolved,
         preparations: bridgeLeases.size, restoring: Number(Boolean(restoring)), unavailable: Number(broker.unavailable) };

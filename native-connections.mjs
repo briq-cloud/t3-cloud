@@ -29,7 +29,7 @@ export function nativeConnections(env = process.env, { signIn = (options, ended)
     }));
   const accessId = value => typeof value === 'string' && /^[a-zA-Z0-9_-]{1,128}$/.test(value);
   let releaseClaude, releaseBriq;
-  let claudeLifetimeUnknown = false;
+  let claudeLifetimeUnknown = false, briqLifetimeUnknown = false;
   const claude = signIn({ name: 'claude', login: ['claude', 'auth', 'login'] }, outcome => {
     if (outcome === 'terminated' || outcome === 'never-spawned') { releaseClaude?.(); releaseClaude = undefined; }
     else { claudeLifetimeUnknown = true; claudeCredentialOwner?.quarantine(); }
@@ -45,10 +45,13 @@ export function nativeConnections(env = process.env, { signIn = (options, ended)
         { onLifetime: outcome => { lifetime = outcome; } });
     } finally {
       if (lifetime === 'terminated' || lifetime === 'never-spawned') release?.();
-      else claudeCredentialOwner?.quarantine();
+      else { claudeLifetimeUnknown = true; claudeCredentialOwner?.quarantine(); }
     }
   };
-  const briq = signIn({ name: 'briq', login: ['briq', 'login'] }, () => { releaseBriq?.(); releaseBriq = undefined; });
+  const briq = signIn({ name: 'briq', login: ['briq', 'login'] }, outcome => {
+    if (outcome === 'terminated' || outcome === 'never-spawned') { releaseBriq?.(); releaseBriq = undefined; }
+    else briqLifetimeUnknown = true;
+  });
   const briqStatusOwned = async () => {
     if (releaseBriq) return null;
     let release;
@@ -68,6 +71,7 @@ export function nativeConnections(env = process.env, { signIn = (options, ended)
       return claude.start(env);
     }, claudeInput: code => claude.input(code), claudeCancel: () => claude.cancel(),
     briqLogin: () => {
+      if (briqLifetimeUnknown) throw Error('Briq credential process lifetime unknown');
       if (!releaseBriq) releaseBriq = briqCredentialOwner?.acquire({ kind: 'sign-in' });
       return briq.start(env);
     },
@@ -107,7 +111,8 @@ export function nativeConnections(env = process.env, { signIn = (options, ended)
       await nativeAuth([kind, 'revoke', id]);
       return { revoked: true };
     },
-    updateIdle() { return !releaseClaude && !releaseBriq && !claudeLifetimeUnknown &&
+    updateIdle() { return !releaseClaude && !releaseBriq && !claudeLifetimeUnknown && !briqLifetimeUnknown &&
+      !claudeCredentialOwner?.current && !claudeCredentialOwner?.quarantined && !briqCredentialOwner?.current &&
       !['starting', 'waiting'].includes(claude.status.state) && !['starting', 'waiting'].includes(briq.status.state); },
     close() { claude.cancel(); briq.cancel(); },
   };

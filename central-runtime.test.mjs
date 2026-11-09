@@ -328,3 +328,26 @@ test('source preparation composition binds lease to source project/root and clos
  assert.equal(closed,1);assert.equal(stops,1);assert.equal(sessions.size,0);assert.deepEqual(f.calls,[]);
  await assert.rejects(runtime.allocator.managedPreparationSession(...args,identity));
 });
+
+for (const wrapped of [false, true]) test(`update drain counts ${wrapped ? 'scoped operation' : 'direct turn'} admitted before delayed capabilities`, async t => {
+ const f=await fixture(t);const runtime=await createCentralRuntime(f.env,f.deps);f.runtimes.push(runtime);await runtime.restore();
+ const store=new AllocationStore(join(f.directory,'allocations'));
+ await store.save({ownerId:'owner',state:'ready',threadId:'t3',allocationId:'allocation',bridgeToken:'bridge',nativeThreadId:'native',nativeModel:'mock',execEnvironmentId:'exec',execUrl:'wss://child.example/_cloud/exec',execToken:'capability'});
+ const received=[];const session=await runtime.broker.connect('bridge',value=>received.push(value),()=>{});
+ await session.receive({id:0,method:'initialize'});
+ let release,entered;const waiting=new Promise(resolve=>{entered=resolve;});
+ const original=f.app.request;
+ f.app.request=async(method,params)=>{if(method==='account/read'){entered();return new Promise(resolve=>{release=()=>resolve({account:null,requiresOpenaiAuth:true});});}return original(method,params);};
+ const params={threadId:'native',input:[{type:'text',text:'held before mutation'}]};
+ const admitted=session.receive(wrapped?{id:1,method:'briq/operation/execute',params:{version:1,threadId:'t3',key:'held-operation',method:'turn/start',params}}:{id:1,method:'turn/start',params});
+ await waiting;runtime.drain();
+ const held=await runtime.updateActivity();assert.equal(held.idle,false);assert.ok(held.counts.receiving>=1);
+ const before=runtime.broker.inflightReceives;
+ await session.receive({id:2,method:'turn/start',params});assert.ok(received.at(-1).error);
+ assert.equal(runtime.broker.inflightReceives,before);
+ release();await admitted;
+ assert.equal(runtime.broker.inflightReceives,0);assert.equal((await runtime.updateActivity()).idle,true);
+ assert.equal(f.calls.some(row=>row.method==='turn/start'),false);
+ await session.receive({id:3,method:'thread/read',params:{threadId:'native'}});
+ assert.equal(runtime.broker.inflightReceives,0);assert.equal((await runtime.updateActivity()).idle,true);
+});

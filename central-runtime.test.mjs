@@ -1,3 +1,4 @@
+import { testOwnership } from './fixtures/runtime-ownership.mjs';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtemp, rm, stat } from 'node:fs/promises';
@@ -21,7 +22,7 @@ async function fixture(t) {
   if(method==='thread/resume')installed.set(params.threadId,params.config['mcp_servers.briq'].http_headers.Authorization);
   if(method==='mcpServerStatus/list'){observed.add(installed.get(params.threadId));return{data:[{name:'briq',tools:{briq_docs:{}}}]};}
   return {model:'mock',thread:{model:'mock',id:'native',sessionId:'native-session',environments:[{environmentId:'exec',cwd:'/work'}],turns:[]}};}};
- return {directory,env,app,calls,runtimes,observed,installed,bindings,closed:()=>closed,deps:{startAppServer:async()=>app,createScopedMcpTransport,cloud:{}}};
+ return {directory,env,app,calls,runtimes,observed,installed,bindings,closed:()=>closed,deps:{acquireOwnership:testOwnership,startAppServer:async()=>app,createScopedMcpTransport,cloud:{}}};
 }
 test('composition holds singleton lock until app-server termination is confirmed',async t=>{
  const f=await fixture(t);let finish;
@@ -35,12 +36,12 @@ test('composition holds singleton lock until app-server termination is confirmed
 test('startup failure closes owned app-server and releases lock after exit',async t=>{
  const f=await fixture(t);
  await assert.rejects(createCentralRuntime({...f.env,T3_CLOUD_CHILD_IMAGE:'unpinned'},f.deps),/digest/);
- assert.equal(f.closed(),1);await assert.rejects(stat(join(f.directory,'central.lock')),{code:'ENOENT'});
+ assert.equal(f.closed(),1);assert.equal(JSON.parse(await (await import('node:fs/promises')).readFile(join(f.directory,'central.ownership.json'),'utf8')).state,'clean');
 });
 test('composition keeps global Briq credentials out of executing provider options under the owner lock',async t=>{
  const f=await fixture(t);let options;
  const env={...f.env,BRIQ_MCP_TOKEN:'explicit-test-grant',BRIQ_API_URL:'https://api.example/v1',BRIQ_API_KEY:'not-an-mcp-grant',OPENAI_API_KEY:'not-forwarded',HOME:'/native-owner-home'};
- const runtime=await createCentralRuntime(env,{...f.deps,startAppServer:async value=>{await stat(join(f.directory,'central.lock/owner.json'));options=value;return f.app;}});f.runtimes.push(runtime);await runtime.restore();
+ const runtime=await createCentralRuntime(env,{...f.deps,startAppServer:async value=>{await stat(join(f.directory,'central.ownership.json'));options=value;return f.app;}});f.runtimes.push(runtime);await runtime.restore();
  assert.deepEqual(options,{binary:'codex',home:join(f.directory,'codex')});
 });
 test('restart restores remote registration then verifies sticky native thread before serving',async t=>{
@@ -327,4 +328,117 @@ test('source preparation composition binds lease to source project/root and clos
  await runtime.allocator.revokeSource('owner',source.sourceId,'allocation','generation');unregister();
  assert.equal(closed,1);assert.equal(stops,1);assert.equal(sessions.size,0);assert.deepEqual(f.calls,[]);
  await assert.rejects(runtime.allocator.managedPreparationSession(...args,identity));
+});
+
+for (const wrapped of [false, true]) test(`update drain counts ${wrapped ? 'scoped operation' : 'direct turn'} admitted before delayed capabilities`, async t => {
+ const f=await fixture(t);const runtime=await createCentralRuntime(f.env,f.deps);f.runtimes.push(runtime);await runtime.restore();
+ const store=new AllocationStore(join(f.directory,'allocations'));
+ await store.save({ownerId:'owner',state:'ready',threadId:'t3',allocationId:'allocation',bridgeToken:'bridge',nativeThreadId:'native',nativeModel:'mock',execEnvironmentId:'exec',execUrl:'wss://child.example/_cloud/exec',execToken:'capability'});
+ const received=[];const session=await runtime.broker.connect('bridge',value=>received.push(value),()=>{});
+ await session.receive({id:0,method:'initialize'});
+ let release,entered;const waiting=new Promise(resolve=>{entered=resolve;});
+ const original=f.app.request;
+ f.app.request=async(method,params)=>{if(method==='account/read'){entered();return new Promise(resolve=>{release=()=>resolve({account:null,requiresOpenaiAuth:true});});}return original(method,params);};
+ const params={threadId:'native',input:[{type:'text',text:'held before mutation'}]};
+ const admitted=session.receive(wrapped?{id:1,method:'briq/operation/execute',params:{version:1,threadId:'t3',key:'held-operation',method:'turn/start',params}}:{id:1,method:'turn/start',params});
+ await waiting;runtime.drain();
+ const held=await runtime.updateActivity();assert.equal(held.idle,false);assert.ok(held.counts.receiving>=1);
+ const before=runtime.broker.inflightReceives;
+ await session.receive({id:2,method:'turn/start',params});assert.ok(received.at(-1).error);
+ assert.equal(runtime.broker.inflightReceives,before);
+ release();await admitted;
+ assert.equal(runtime.broker.inflightReceives,0);assert.equal((await runtime.updateActivity()).idle,true);
+ assert.equal(f.calls.some(row=>row.method==='turn/start'),false);
+ await session.receive({id:3,method:'thread/read',params:{threadId:'native'}});
+ assert.equal(runtime.broker.inflightReceives,0);assert.equal((await runtime.updateActivity()).idle,true);
+});
+
+test('authenticated turn settling during a later durable idle read invalidates the scan and retains unknown outcome', async t => {
+ const f=await fixture(t);const createTransport=f.deps.createScopedMcpTransport;
+ const runtime=await createCentralRuntime(f.env,{...f.deps,createScopedMcpTransport:()=>({...createTransport(),reserveTurn:()=>undefined})});f.runtimes.push(runtime);await runtime.restore();
+ const store=runtime.broker.store;
+ await store.save({ownerId:'owner',state:'ready',threadId:'a-held',allocationId:'allocation',bridgeToken:'held-bridge',nativeThreadId:'native',nativeModel:'mock',execEnvironmentId:'exec',execUrl:'wss://child.example/_cloud/exec',execToken:'capability'});
+ await store.save({ownerId:'owner',state:'ready',threadId:'z-later',allocationId:'later-allocation',bridgeToken:'later-bridge',nativeModel:'mock',execEnvironmentId:'later-exec',execUrl:'wss://child.example/_cloud/exec',execToken:'later-capability'});
+ const received=[];const session=await runtime.broker.connect('held-bridge',value=>received.push(value),()=>{});
+ await session.receive({id:0,method:'initialize'});
+ let releaseCapabilities,capabilitiesEntered;const capabilitiesWaiting=new Promise(resolve=>{capabilitiesEntered=resolve;});
+ const original=f.app.request;let hold=true,nativeCalls=0;
+ f.app.request=async(method,params)=>{
+  if(method==='account/read'&&hold){hold=false;capabilitiesEntered();await new Promise(resolve=>{releaseCapabilities=resolve;});}
+  if(method==='turn/start'){nativeCalls++;throw Error('Native outcome unknown');}
+  return original(method,params);
+ };
+ const admitted=session.receive({id:1,method:'turn/start',params:{threadId:'native',input:[{type:'text',text:'authenticated held turn'}]}});
+ await capabilitiesWaiting;runtime.drain();
+ // Scan reads detached bindings and the held thread's empty markers first,
+ // then pauses on a different binding while that admitted turn finishes.
+ const list=store.list.bind(store);store.list=async()=>(await list()).sort((a,b)=>a.threadId.localeCompare(b.threadId));
+ const markers=store.mutationMarkers.bind(store);let releaseScan,scanEntered,heldMarkers;
+ const scanWaiting=new Promise(resolve=>{scanEntered=resolve;});let pause=true;
+ store.mutationMarkers=async threadId=>{
+  const values=await markers(threadId);
+  if(threadId==='a-held'&&pause)heldMarkers=values;
+  if(threadId==='z-later'&&pause){pause=false;scanEntered();await new Promise(resolve=>{releaseScan=resolve;});}
+  return values;
+ };
+ const scanning=runtime.updateActivity();await scanWaiting;assert.deepEqual(heldMarkers,[]);
+ releaseCapabilities();await admitted;
+ assert.equal(nativeCalls,1);assert.ok(received.at(-1).error);
+ assert.equal(runtime.broker.inflightReceives,0);assert.equal(runtime.broker.mutations.size,0);assert.equal(runtime.broker.pendingTurns.size,0);assert.equal(store.active.size,0);
+ assert.equal((await store.load('a-held')).turnState,'unknown');assert.equal((await markers('a-held')).length,1);
+ releaseScan();const result=await scanning;
+ assert.equal(result.counts.receiving,0);assert.equal(result.counts.unresolved,0);assert.equal(result.counts.activityChanged,1);assert.equal(result.idle,false);
+ assert.equal(Object.entries(result.counts).filter(([key])=>key!=='activityChanged').every(([,value])=>value===0),true);
+ const next=await runtime.updateActivity();assert.equal(next.counts.activityChanged,0);assert.ok(next.counts.unresolved>=1);assert.equal(next.idle,false);
+});
+
+test('owner-approved cold recovery preserves unknown bindings with zero native, registration, login or pairing replay', async t => {
+ const f=await fixture(t);const store=new AllocationStore(join(f.directory,'allocations'));await store.initialize();
+ const binding={edgeTokenHash:digest(f.env.T3_CLOUD_EDGE_TOKEN),state:'ready',threadId:'t3',allocationId:'allocation',nativeThreadId:'native',turnState:'unknown',nativeState:'unknown',bridgeToken:'bridge',execEnvironmentId:'exec',execUrl:'wss://child.example/_cloud/exec',execToken:'capability'};
+ await store.save(binding);
+ let pairs=0,logins=0,kills=0;
+ const runtime=await createCentralRuntime({...f.env,T3_CLOUD_RECOVERY:'1'},{...f.deps,cloud:{pair(){pairs++;throw Error('no pairing');},login(){logins++;throw Error('no login');},destroy(){kills++;throw Error('no kill');}}});f.runtimes.push(runtime);
+ await runtime.restore();await runtime.restore();
+ assert.equal(runtime.ready(),true);assert.deepEqual(f.calls,[]);assert.deepEqual([pairs,logins,kills],[0,0,0]);
+ const persisted=await store.load('t3');assert.equal(persisted.nativeThreadId,'native');assert.equal(persisted.nativeState,'unknown');assert.equal(persisted.turnState,'unknown');assert.equal(persisted.restoreState,'reconciliation-required');
+ assert.deepEqual(await runtime.allocator.phoneChildren('owner'),[]);
+});
+
+
+test('cold recovery quarantines allocation retries and source admission while fresh work stays available', async t => {
+ const f=await fixture(t);const store=new AllocationStore(join(f.directory,'allocations'));await store.initialize();
+ const source={version:1,sourceId:'source-recovered-123456',hostProjectId:'project',logicalRoot:'/projects/source-recovered-123456',clone:{remoteUrl:'https://github.com/up-lab/example.git',protocol:'https'}};
+ source.sourceDigest=digest(canonicalJson(source));
+ const common={ownerId:'owner',edgeTokenHash:digest(f.env.T3_CLOUD_EDGE_TOKEN),allocationId:'allocation',projectId:'project',state:'ready'};
+ for(const state of ['ready','created','creating','unknown']) {
+  await store.save({...common,state,threadId:`old-${state}`,providerInstanceId:'codex',nativeThreadId:'native',nativeState:'unknown',turnState:'unknown'});
+  const projectSource={...source,sourceId:`source-${state}-123456789`,logicalRoot:`/projects/source-${state}-123456789`};
+  delete projectSource.sourceDigest;projectSource.sourceDigest=digest(canonicalJson(projectSource));
+  await store.saveSource({...common,state,purpose:'project-source',projectSource,managedBridge:{ownerGeneration:'generation'}});
+ }
+ const external=[];
+ const cloud={
+  create:async binding=>{external.push('create');return{id:'child',stackId:'stack'};},
+  find:async()=>{external.push('find');return{id:'child',stackId:'stack'};},
+  endpoints:async()=>{external.push('endpoints');return{t3Url:'https://child.example',execUrl:'wss://child.example/_cloud/exec'};},
+  descriptor:async()=>{external.push('descriptor');return{environmentId:'environment'};},
+  pair:async()=>{external.push('pair');return'credential';},
+ };
+ const runtime=await createCentralRuntime({...f.env,T3_CLOUD_RECOVERY:'1'},{...f.deps,cloud});f.runtimes.push(runtime);
+ await runtime.restore();
+ for(const state of ['ready','created','creating','unknown']) {
+  const binding=await store.load(`old-${state}`),sourceBinding=await store.loadSource(`source-${state}-123456789`);
+  assert.equal(binding.state,state);assert.equal(sourceBinding.state,state);
+  assert.equal(binding.restoreState,'reconciliation-required');assert.equal(sourceBinding.restoreState,'reconciliation-required');
+  await assert.rejects(runtime.allocator.allocate('owner',binding.threadId,'codex'),/explicit reconciliation/);
+  await assert.rejects(runtime.allocator.allocateSource('owner',sourceBinding.projectSource,'generation'),/explicit reconciliation/);
+  assert.deepEqual(await store.load(binding.threadId),binding);assert.deepEqual(await store.loadSource(sourceBinding.projectSource.sourceId),sourceBinding);
+ }
+ assert.deepEqual(external,[]);assert.deepEqual(f.calls,[]);
+ const fresh=await runtime.allocator.allocate('owner','fresh-thread','codex');
+ assert.equal(fresh.connection.credential,'credential');assert.deepEqual(external,['create','endpoints','descriptor','pair']);
+ assert.deepEqual(f.calls.map(call=>call.method),['environment/add']);
+ external.length=0;f.calls.length=0;
+ const freshSource=await runtime.allocator.allocateSource('owner',source,'generation');
+ assert.equal(freshSource.sourceId,source.sourceId);assert.deepEqual(external,['create','endpoints','descriptor']);assert.deepEqual(f.calls,[]);
 });

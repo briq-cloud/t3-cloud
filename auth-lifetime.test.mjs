@@ -140,12 +140,12 @@ test('direct helper composes real piped line input with exact local child termin
 
 for (const trigger of ['cancel', 'timeout', 'error']) test(`real Briq PTY ${trigger} with failed kill/no exit retains owner and prevents replacement`, async () => {
   const child = processFixture(), owner = new BriqCredentialOwner();
-  let spawns = 0, ends = 0;
+  let spawns = 0, ends = 0; const outcomes = [];
   const connections = nativeConnections({}, { briqCredentialOwner: owner,
     signIn: (cli, ended) => new SignIn(cli, undefined, {
       timeoutMs: trigger === 'timeout' ? 0 : 1000, cleanupTimeoutMs: 0,
       spawnProcess: command => { assert.equal(command, 'script'); spawns++; return child; },
-    }, outcome => { ends++; ended(outcome); }),
+    }, outcome => { ends++; outcomes.push(outcome); ended(outcome); }),
   });
   const login = connections.briqLogin(); child.spawned();
   if (trigger === 'cancel') connections.close();
@@ -157,10 +157,19 @@ for (const trigger of ['cancel', 'timeout', 'error']) test(`real Briq PTY ${trig
   await new Promise(resolve => setTimeout(resolve, 5));
   assert.throws(() => owner.acquire({kind:'operation'}), /busy/);
   assert.equal(ends, 0); assert.equal(spawns, 1);
+  assert.equal(connections.updateIdle(), false);
+  const retained = owner.current;
   assert.equal((await connections.briqLogin()).state, 'failed');
   assert.equal(spawns, 1); assert.equal(ends, 0);
-  // Preserve the pre-existing PTY policy: actual wrapper exit ends this flow.
+  // Wrapper termination completes the UI flow, but does not prove that its
+  // credential-bearing descendant ended. A late exit cannot authorize handoff.
   child.end(null, 'SIGKILL');
-  assert.equal(ends, 1);
-  const release = owner.acquire({kind:'operation'}); release();
+  assert.equal(ends, 1); assert.deepEqual(outcomes, ['unknown']);
+  assert.equal(owner.current, retained);
+  assert.throws(() => owner.acquire({kind:'operation'}), /busy/);
+  assert.equal(connections.updateIdle(), false);
+  assert.throws(() => connections.briqLogin(), /lifetime unknown/);
+  connections.close(); child.end(null, 'SIGKILL');
+  assert.equal(ends, 1); assert.equal(spawns, 1);
+  assert.equal(owner.current, retained); assert.equal(connections.updateIdle(), false);
 });

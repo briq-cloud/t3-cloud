@@ -17,6 +17,13 @@ ENV DISABLE_AUTOUPDATER=1 \
     DISABLE_UPDATES=1 \
     BROWSER=/usr/local/bin/show-url
 
+# Bootstrap provenance verifier. A runtime release cannot replace this binary.
+RUN curl -fsSL --retry 3 https://github.com/cli/cli/releases/download/v2.103.3/gh_2.103.3_linux_amd64.tar.gz -o /tmp/gh.tar.gz \
+  && echo '4c806978ffce1cec70853302a56d70ac6da4f19bae7adca4e1a8ab00633dd91d  /tmp/gh.tar.gz' | sha256sum -c - \
+  && tar -xzf /tmp/gh.tar.gz -C /tmp gh_2.103.3_linux_amd64/bin/gh \
+  && install -m 755 /tmp/gh_2.103.3_linux_amd64/bin/gh /usr/local/bin/gh \
+  && rm -rf /tmp/gh.tar.gz /tmp/gh_2.103.3_linux_amd64
+
 # Claude Code: the native binary and its checksum, from the bucket its installer reads.
 RUN B=https://downloads.claude.ai/claude-code-releases \
   && V="${CLAUDE_VERSION:-$(curl -fsSL "$B/stable")}" \
@@ -86,9 +93,9 @@ RUN npm install --global pnpm@12.14.0 --ignore-scripts --no-fund --no-audit \
   && pnpm exec vp run --filter t3 build \
   && pnpm --filter t3 deploy --prod --legacy --config.allow-unused-patches=true /out/t3 \
   && cp /usr/local/bin/node /out/t3/node \
-  && cp /input/LICENSE /input/source.json /out/t3/ \
-  && printf '#!/bin/sh\nexec /opt/t3/node /opt/t3/dist/bin.mjs "$@"\n' > /out/t3/t3 \
-  && chmod 755 /out/t3/t3
+  && cp /input/LICENSE /input/source.json /out/t3/
+COPY bin/t3 /out/t3/t3
+RUN chmod 755 /out/t3/t3
 # Keep the unmodified, checksum-verified native resource monitor sidecar.
 RUN curl -fsSL https://github.com/pingdotgg/t3code/releases/download/v0.1.6/t3-0.1.6-linux-x64.tar.gz -o /tmp/t3.tar.gz \
   && echo '7cf31da90dee41f524dd5b679ebb6d404637ca5d9dc6fd8bc019511d57bb77e6  /tmp/t3.tar.gz' | sha256sum -c - \
@@ -96,6 +103,9 @@ RUN curl -fsSL https://github.com/pingdotgg/t3code/releases/download/v0.1.6/t3-0
   && cp -a /tmp/t3-release/resource-monitor /out/t3/
 
 FROM native-clis AS t3-cloud
+LABEL org.opencontainers.image.source="https://github.com/briq-cloud/t3-cloud"
+ARG BASE
+RUN printf '%s\n' "${BASE##*@}" > /etc/t3-cloud/base-image
 COPY --from=t3-source /out/t3 /opt/t3
 # T3's SDK/tool protocol has its own compatibility pin.
 RUN V="$(node -p 'require("/opt/t3/source.json").claude')" \
@@ -112,16 +122,24 @@ RUN test "$(cat /etc/t3-cloud/codex-version)" = "$(node -p 'require("/opt/t3/sou
   && test -x /opt/t3/t3 \
   && printf 'T3 Code source\t2359643cffa6ba9ee84d6f2694b935de54a8013e\tpinned source, lock and local patch\n' >> /etc/t3-cloud/downloads
 
+ARG SOURCE_COMMIT
+RUN printf '%s' "$SOURCE_COMMIT" | grep -Eq '^[a-f0-9]{40}$' \
+  && printf '%s\n' "$SOURCE_COMMIT" > /etc/t3-cloud/source
 COPY . /opt/t3-cloud
 # Use the same pinned Node for the manager, child and scoped transport shim.
 # The runtime imports native TypeScript modules and requires bash for child execution.
 RUN ln -sf /opt/t3/node /usr/local/bin/node \
   && test "$(node --version)" = "v$(node -p 'require("/opt/t3/source.json").node')" \
   && test -x /bin/bash \
+  && test -x /usr/bin/flock \
+  && /usr/bin/flock --exclusive --nonblock /tmp/t3-flock-build-proof /bin/true \
   && cd /opt/t3-cloud \
   && npm ci --omit=dev --ignore-scripts --no-fund --no-audit \
+  && node --test runtime-ownership.test.mjs \
   && npm cache clean --force
+COPY runtime-bootstrap-migration.mjs runtime-loader.mjs runtime-supervisor.mjs runtime-process.mjs runtime-bundle.mjs runtime-ownership.mjs runtime-controller-process.mjs /opt/t3-bootstrap/
 COPY bin/t3-cloud-start /usr/local/bin/t3-cloud-start
-RUN chmod 755 /usr/local/bin/t3-cloud-start
+RUN chmod 755 /usr/local/bin/t3-cloud-start /opt/t3-cloud/bin/codex-remote /opt/t3-cloud/bin/release-shims/runtime-command \
+  && bash /opt/t3-cloud/bin/normalize-runtime-image
 EXPOSE 8080
 CMD ["t3-cloud-start"]

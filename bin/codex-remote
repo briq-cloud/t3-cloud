@@ -1,2 +1,4 @@
 #!/bin/sh
-exec node /opt/t3-cloud/codex-remote.mjs "$@"
+set -eu
+runtime=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
+exec "$runtime/t3/node" "$runtime/t3-cloud/codex-remote.mjs" "$@"

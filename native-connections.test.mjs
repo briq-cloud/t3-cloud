@@ -16,7 +16,7 @@ test('native sign-in, status and pairing helpers receive no executing MCP grant 
  const expected={HOME:env.HOME,T3_STATE:env.T3_STATE};
  const connections=nativeConnections(env,{
   signIn:({name})=>({status:{state:'idle'},start:async value=>{calls.push(name+'-login');assert.deepEqual(value,expected);return {state:'idle'};},cancel(){},input(){}}),
-  status:async(command,value)=>{calls.push('claude-status');assert.deepEqual(value,expected);return false;},
+  status:async(command,value,_timeout,_subscription,_billing,options)=>{options.onLifetime('terminated');calls.push('claude-status');assert.deepEqual(value,expected);return false;},
   briqIdentity:async value=>{calls.push('briq-status');assert.deepEqual(value,expected);return false;},
   pair:(command,args,options,done)=>{calls.push('pair');assert.deepEqual(options.env,expected);done(null,JSON.stringify({pairUrl:'https://cloud.example/pair#fake',credential:'fake-native-pairing'}));},
  });
@@ -55,7 +55,7 @@ test('Briq native login/status share CLI refresh ownership until actual process 
  assert.equal((await connections.status()).briq.authenticated,null); assert.equal(reads,0);
  release(); await connections.briqLogin(); connections.close();
  assert.throws(()=>owner.acquire({kind:'operation'}),/busy/);
- ended(); assert.equal((await connections.status()).briq.authenticated,true); assert.equal(reads,1);
+ ended('terminated'); assert.equal((await connections.status()).briq.authenticated,true); assert.equal(reads,1);
 });
 
 
@@ -71,4 +71,24 @@ test('central phone metadata and QR use native central code, expiry and isolated
  await assert.rejects(connections.phoneRevoke('other','id'));await assert.rejects(connections.phoneRevoke('pairing','../id'));
  result=[];assert.deepEqual(await connections.phoneAccess(),{pairings:[],sessions:[]});
  connections.close();
+});
+
+test('unknown Briq sign-in wrapper lifetime retains credential ownership and blocks runtime updates',async()=>{
+ const {BriqCredentialOwner}=await import('./briq-cloud.mjs');const owner=new BriqCredentialOwner();let ended;
+ const connections=nativeConnections({}, {briqCredentialOwner:owner,
+  signIn:({name},onEnd)=>{if(name==='briq')ended=onEnd;return{status:{state:'idle'},start:async()=>({state:'idle'}),cancel(){}};},
+ });
+ assert.equal(connections.updateIdle(),true);await connections.briqLogin();assert.equal(connections.updateIdle(),false);
+ ended('unknown');assert.equal(connections.updateIdle(),false);assert.ok(owner.current);
+ assert.throws(()=>owner.acquire({kind:'operation'}),/busy/);assert.throws(()=>connections.briqLogin(),/lifetime unknown/);
+ connections.close();assert.equal(connections.updateIdle(),false);
+});
+
+test('unknown Claude status lifetime and credential quarantine block update idleness',async()=>{
+ const owner=new ClaudeCredentialOwner();
+ const connections=nativeConnections({}, {claudeCredentialOwner:owner,
+  signIn:()=>({status:{state:'idle'},cancel(){}}),status:async()=>null,briqIdentity:async()=>false,
+ });
+ assert.equal(connections.updateIdle(),true);await connections.status();
+ assert.equal(owner.quarantined,true);assert.equal(connections.updateIdle(),false);
 });

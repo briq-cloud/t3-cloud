@@ -157,8 +157,11 @@ function textInput(input) {
 export class CapabilityBroker {
   constructor({ store, app, claude, briqTransport, admittedProviders = ['codex'] }) {
     this.admittedProviders = new Set(admittedProviders.map(providerInstanceId));
-    Object.assign(this, { store, app, claude, briqTransport }); this.sessions = new Set(); this.approvals = new Map(); this.sequence = 0; this.registered = new Set(); this.activeTurns = new Map(); this.finishedTurns = new Map(); this.unavailable = false; this.mutations = new Map(); this.owners = new Map(); this.pendingTurns = new Map(); this.questionTurns = new Map(); this.seenQuestions = new Set();
-    app.events.on('message', message => { this.deliver(message).catch(() => {}); });
+    Object.assign(this, { store, app, claude, briqTransport }); this.sessions = new Set(); this.approvals = new Map(); this.sequence = 0; this.registered = new Set(); this.activeTurns = new Map(); this.finishedTurns = new Map(); this.unavailable = false; this.mutations = new Map(); this.owners = new Map(); this.pendingTurns = new Map(); this.questionTurns = new Map(); this.seenQuestions = new Set(); this.loginPending = new Set(); this.inflightReceives = 0; this.activityGeneration = 0;
+    app.events.on('message', message => {
+      if (message.method === 'account/login/completed' && typeof message.params?.loginId === 'string') this.loginPending.delete(message.params.loginId);
+      this.deliver(message).catch(() => {});
+    });
     app.events.on('closed', () => { this.briqTransport?.close(); this.unavailable = true; this.registered.clear(); this.approvals.clear(); for (const session of this.sessions) session.close(); });
   }
   async registerEnvironment(binding) {
@@ -392,7 +395,13 @@ export class CapabilityBroker {
   async receive(session, message, operation) {
     if (!message || typeof message !== 'object' || JSON.stringify(message).length > 2097152) return session.close();
     const id = message.id; let mutation;
+    // Admission is counted before the first await, including capability lookups
+    // and nested operation dispatch, until all effects and replies settle.
+    this.inflightReceives++; this.activityGeneration++;
     try {
+      if (this.draining && ['thread/start', 'thread/resume', 'turn/start', 'turn/steer',
+          'briq/operation/execute', 'claude/allocate', 'claude/open', 'claude/offer', 'claude/model'].includes(message.method))
+        throw Error('Runtime is draining for update');
       const binding = await this.binding(session);
       if (message.method === 'bridge/capabilities') {
         if (!['number', 'string'].includes(typeof id) || message.params !== undefined &&
@@ -560,7 +569,7 @@ export class CapabilityBroker {
         }
       }
       if (!session.closed) await session.send(pending ? error(id, 'Sandbox operation outcome requires reconciliation', true) : error(id));
-    }
+    } finally { this.inflightReceives--; this.activityGeneration++; }
   }
   publicResult(value) {
     if (Array.isArray(value)) return value.map(item => this.publicResult(item));
@@ -661,7 +670,13 @@ export class CapabilityBroker {
   async ownerRequest(method, params) {
     if (!['account/read', 'account/login/start', 'account/login/cancel', 'account/logout'].includes(method)) throw Error('Unsupported connection operation');
     if (method === 'account/login/start' && (params?.type !== 'chatgptDeviceCode' || Object.keys(params).some(key => !['type'].includes(key)))) throw Error('Only native ChatGPT sign-in supported');
+    if (this.draining) throw Error('Runtime is draining for update');
+    if (method === 'account/login/start') this.loginPending.add('request-pending');
     const response = await this.app.request(method, params);
+    if (method === 'account/login/start' && typeof response.loginId === 'string') {
+      this.loginPending.delete('request-pending'); this.loginPending.add(response.loginId);
+    }
+    if (method === 'account/login/cancel') this.loginPending.delete(params.loginId);
     if (method === 'account/read') return { account: response.account ? { type: response.account.type, email: response.account.email, planType: response.account.planType } : null, requiresOpenaiAuth: response.requiresOpenaiAuth };
     return response;
   }

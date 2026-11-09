@@ -33,6 +33,7 @@ jobs:
       codex: ${{ steps.version.outputs.codex }}
       codex_sha256: ${{ steps.version.outputs.codex_sha256 }}
       claude: ${{ steps.version.outputs.claude }}
+      checked_image_id: ${{ steps.checked.outputs.image_id }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -41,7 +42,7 @@ jobs:
       - name: Check runtime and release resolution
         run: |
           npm ci --omit=dev --ignore-scripts --no-fund --no-audit
-          node --test --test-timeout=20000 ./*.test.mjs bin/resolve-gh-release.test.mjs
+          node --test --test-timeout=20000 ./*.test.mjs bin/*.test.mjs
       - uses: docker/setup-buildx-action@v3
       - name: Resolve pinned inputs and immutable tag
         id: version
@@ -54,7 +55,8 @@ jobs:
           node bin/resolve-gh-release.mjs openai/codex rust-v codex-package-x86_64-unknown-linux-musl.tar.gz "$codex_version" > /tmp/codex-release
           read -r codex codex_sha256 < /tmp/codex-release
           rm /tmp/codex-release
-          base="ghcr.io/briq-cloud/sandbox@$(docker buildx imagetools inspect ghcr.io/briq-cloud/sandbox:latest --format '{{json .Manifest}}' | jq -r .digest)"
+          base="$(awk '/^ARG BASE=/{ if (++n > 1) exit 1; sub(/^ARG BASE=/, ""); print } END { if (n != 1) exit 1 }' Dockerfile)"
+          [[ "$base" =~ ^ghcr\.io/briq-cloud/sandbox@sha256:[0-9a-f]{64}$ ]]
           tag="$(date -u +%Y-%m-%d)"
           if [ "${{ github.event_name }}" != pull_request ]; then
             n=1
@@ -78,6 +80,7 @@ jobs:
           provenance: false
           build-args: |
             BASE=${{ steps.version.outputs.base }}
+            SOURCE_COMMIT=${{ github.sha }}
             CLAUDE_VERSION=${{ steps.version.outputs.claude }}
             CODEX_VERSION=${{ steps.version.outputs.codex }}
             CODEX_SHA256=${{ steps.version.outputs.codex_sha256 }}
@@ -110,17 +113,24 @@ jobs:
           NODE
           # Generated credentials stay in the private env file; never print or inspect it.
           t3_smoke_id="$(docker run -d --network none --env-file "$smoke_env" --name t3-cloud-smoke "$T3_IMAGE:${{ steps.version.outputs.tag }}")"
+          echo 'smoke: readiness'
           for _ in $(seq 1 30); do
             docker exec "$t3_smoke_id" node -e "fetch('http://127.0.0.1:8080/.well-known/t3/environment').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))" && break
             sleep 1
           done
           docker exec "$t3_smoke_id" node -e "fetch('http://127.0.0.1:8080/.well-known/t3/environment').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+          echo 'smoke: capabilities'
           docker exec "$t3_smoke_id" node -e 'const assert=require("node:assert/strict");fetch("http://127.0.0.1:8080/_cloud/capabilities").then(async r=>{assert.equal(r.status,200);assert.deepEqual(await r.json(),{role:"central"})}).catch(()=>process.exit(1))'
-          docker exec "$t3_smoke_id" sh -c 'test -x /bin/bash && test -d /work/.t3-cloud/central.lock && test ! -e /opt/agent-home-runner && test ! -e /opt/dsh && test ! -e /usr/local/bin/briq-agent-acp'
+          echo 'smoke: ownership'
+          docker exec "$t3_smoke_id" node -e 'const assert=require("node:assert/strict"),fs=require("node:fs"),cp=require("node:child_process"),dir="/work/.t3-cloud",owner=JSON.parse(fs.readFileSync(dir+"/central.ownership.json","utf8"));assert.equal(owner.protocol,1);assert.equal(owner.environmentBinding,"ci-smoke-owner");assert.match(owner.generation,/^[a-f0-9-]{36}$/);assert.equal(owner.bootId,fs.readFileSync("/proc/sys/kernel/random/boot_id","utf8").trim());assert.equal(owner.pidNamespace,String(fs.statSync("/proc/self/ns/pid").ino));assert.ok(Number.isSafeInteger(owner.pid)&&owner.pid>0);assert.match(owner.procStartTicks,/^[0-9]+$/);assert.equal(owner.state,"active");const lock=cp.spawnSync("/usr/bin/flock",["--exclusive","--nonblock","--conflict-exit-code","73",dir+"/central.ownership.lock","/bin/true"],{encoding:"utf8"});assert.equal(lock.status,73)'
+          docker exec "$t3_smoke_id" sh -c 'test -x /bin/bash && test ! -e /opt/agent-home-runner && test ! -e /opt/dsh && test ! -e /usr/local/bin/briq-agent-acp'
+          echo 'smoke: versions'
           docker exec "$t3_smoke_id" node -e 'const assert=require("node:assert/strict"),fs=require("node:fs"),cp=require("node:child_process"),version=require("/opt/t3/source.json").codex;assert.equal(cp.execFileSync("codex",["--version"],{encoding:"utf8"}).trim(),`codex-cli ${version}`);assert.equal(fs.readFileSync("/etc/t3-cloud/codex-version","utf8").trim(),version);assert.equal(cp.execFileSync("/opt/t3-cloud/bin/codex-remote",["--version"],{encoding:"utf8"}).trim(),`codex-cli ${version}`);assert.equal(process.versions.node,require("/opt/t3/source.json").node);assert.equal(require("/opt/t3-cloud/node_modules/ws/package.json").version,"8.22.0")'
           # Uses the actual image-pinned native CLIs, without credentials or model calls.
           # A second bootstrap must preserve the definitions accepted during native startup.
+          echo 'smoke: rebootstrap'
           docker exec "$t3_smoke_id" t3-cloud-start true
+          echo 'smoke: config'
           docker exec "$t3_smoke_id" node -e 'const fs=require("node:fs"),assert=require("node:assert/strict");assert.match(fs.readFileSync("/work/.logins/codex/config.toml","utf8"),/bearer_token_env_var = "BRIQ_MCP_TOKEN"/);assert.equal(JSON.parse(fs.readFileSync("/work/.logins/claude/.claude.json","utf8")).mcpServers.briq.headers.Authorization,"Bearer \u0024{BRIQ_MCP_TOKEN}");assert.ok(fs.existsSync("/work/.t3/home/.agents/skills/briq/SKILL.md"));assert.ok(fs.existsSync("/work/.logins/claude/skills/briq/SKILL.md"))'
 
       # The image fixture exercises Claude tool policy and native Codex MCP turns with fake providers.
@@ -134,12 +144,57 @@ jobs:
           timeout --signal=TERM --kill-after=5s 155s docker start --attach "$claude_probe_id"
           test "$(docker inspect --format '{{.State.Status}}:{{.State.ExitCode}}' "$claude_probe_id")" = 'exited:0'
 
+      - name: Package runtime candidate from checked image
+        env:
+          BASE: ${{ steps.version.outputs.base }}
+          TAG: ${{ steps.version.outputs.tag }}
+          SOURCE: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/runtime-image-root"
+          mkdir "$root"
+          image_id="$(docker create "$T3_IMAGE:$TAG")"
+          trap 'docker rm -v "$image_id" > /dev/null' EXIT
+          docker export "$image_id" | tar -xf - -C "$root"
+          # Normalize the exported snapshot without changing the checked image.
+          bash bin/normalize-runtime-image "$root"
+          # An unattested PR artifact exercises inventory/archive conformance only.
+          # The published bundle is repacked with the final registry digest below.
+          node bin/package-runtime-release.mjs "$root" "$RUNNER_TEMP/runtime-candidate" "${BASE##*@}" "$SOURCE" "$T3_IMAGE@sha256:$(printf '%064d' 0)"
+          node bin/check-runtime-release.mjs "$RUNNER_TEMP/runtime-candidate"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: runtime-candidate
+          path: |
+            ${{ runner.temp }}/runtime-candidate/manifest.json
+            ${{ runner.temp }}/runtime-candidate/runtime-blobs.tar
+          compression-level: 0
+          retention-days: 3
+          if-no-files-found: error
+      - name: Save checked image for manual publication
+        id: checked
+        if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && inputs.publish == true
+        run: |
+          mkdir "$RUNNER_TEMP/checked-image"
+          image_id="$(docker image inspect "$T3_IMAGE:${{ steps.version.outputs.tag }}" --format '{{.Id}}')"
+          [[ "$image_id" =~ ^sha256:[a-f0-9]{64}$ ]]
+          echo "image_id=$image_id" >> "$GITHUB_OUTPUT"
+          docker save --output "$RUNNER_TEMP/checked-image/image.tar" "$image_id"
+      - uses: actions/upload-artifact@v4
+        if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && inputs.publish == true
+        with:
+          name: checked-runtime-image
+          path: ${{ runner.temp }}/checked-image/image.tar
+          compression-level: 0
+          retention-days: 1
+          if-no-files-found: error
+
   publish:
-    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && inputs.publish == true
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && github.repository == 'briq-cloud/t3-cloud' && github.repository_id == '1450999885' && inputs.publish == true
     needs: image
     runs-on: ubuntu-24.04
     permissions:
-      contents: read
+      contents: write
       packages: write
       id-token: write
       attestations: write
@@ -151,84 +206,79 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      # Rebuild with the checked inputs; rerun image probes on these exact bytes before pushing.
-      - name: Build release image
-        uses: docker/build-push-action@v6
+      - uses: actions/setup-node@v4
         with:
-          context: .
-          target: t3-cloud
-          platforms: linux/amd64
-          push: false
-          load: true
-          provenance: false
-          build-args: |
-            BASE=${{ needs.image.outputs.base }}
-            CLAUDE_VERSION=${{ needs.image.outputs.claude }}
-            CODEX_VERSION=${{ needs.image.outputs.codex }}
-            CODEX_SHA256=${{ needs.image.outputs.codex_sha256 }}
-            TTYD_VERSION=1.7.7
-          tags: ${{ env.T3_IMAGE }}:${{ needs.image.outputs.tag }}
-          cache-from: type=gha,scope=t3-cloud
-      # Empty central state initializes the actual pinned local app-server. Network isolation
-      # excludes cloud allocation and login; this smoke does not qualify turns or recovery.
-      - name: Offline central startup and Codex version/config smoke test
-        run: |
-          set -eu
-          smoke_env="$(mktemp)"
-          t3_smoke_id=
-          trap 'if [ -n "$t3_smoke_id" ]; then docker rm -fv "$t3_smoke_id" > /dev/null 2>&1 || true; fi; rm -f "$smoke_env"' EXIT
-          node --input-type=module - "$smoke_env" <<'NODE'
-          import { writeFileSync } from 'node:fs';
-          import { randomBytes } from 'node:crypto';
-          writeFileSync(process.argv[2], [
-            `T3_CLOUD_OWNER_KEY=${randomBytes(32).toString('base64url')}`,
-            `T3_CLOUD_EDGE_TOKEN=${randomBytes(32).toString('base64url')}`,
-            'T3_CLOUD_OWNER_ID=ci-smoke-owner',
-            'T3_CLOUD_STATE=/work/.t3-cloud',
-            'T3_CLOUD_PUBLIC_ORIGIN=https://t3-smoke.invalid',
-            `T3_CLOUD_CHILD_IMAGE=ghcr.io/briq-cloud/t3-cloud@sha256:${'0'.repeat(64)}`,
-            'BRIQ_API_URL=http://127.0.0.1:9',
-            'BRIQ_MCP_URL=https://127.0.0.1:9/mcp',
-            '',
-          ].join('\n'), { mode: 0o600 });
-          NODE
-          # Generated credentials stay in the private env file; never print or inspect it.
-          t3_smoke_id="$(docker run -d --network none --env-file "$smoke_env" --name t3-cloud-smoke "$T3_IMAGE:${{ needs.image.outputs.tag }}")"
-          for _ in $(seq 1 30); do
-            docker exec "$t3_smoke_id" node -e "fetch('http://127.0.0.1:8080/.well-known/t3/environment').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))" && break
-            sleep 1
-          done
-          docker exec "$t3_smoke_id" node -e "fetch('http://127.0.0.1:8080/.well-known/t3/environment').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
-          docker exec "$t3_smoke_id" node -e 'const assert=require("node:assert/strict");fetch("http://127.0.0.1:8080/_cloud/capabilities").then(async r=>{assert.equal(r.status,200);assert.deepEqual(await r.json(),{role:"central"})}).catch(()=>process.exit(1))'
-          docker exec "$t3_smoke_id" sh -c 'test -x /bin/bash && test -d /work/.t3-cloud/central.lock && test ! -e /opt/agent-home-runner && test ! -e /opt/dsh && test ! -e /usr/local/bin/briq-agent-acp'
-          docker exec "$t3_smoke_id" node -e 'const assert=require("node:assert/strict"),fs=require("node:fs"),cp=require("node:child_process"),version=require("/opt/t3/source.json").codex;assert.equal(cp.execFileSync("codex",["--version"],{encoding:"utf8"}).trim(),`codex-cli ${version}`);assert.equal(fs.readFileSync("/etc/t3-cloud/codex-version","utf8").trim(),version);assert.equal(cp.execFileSync("/opt/t3-cloud/bin/codex-remote",["--version"],{encoding:"utf8"}).trim(),`codex-cli ${version}`);assert.equal(process.versions.node,require("/opt/t3/source.json").node);assert.equal(require("/opt/t3-cloud/node_modules/ws/package.json").version,"8.22.0")'
-          # Uses the actual image-pinned native CLIs, without credentials or model calls.
-          # A second bootstrap must preserve the definitions accepted during native startup.
-          docker exec "$t3_smoke_id" t3-cloud-start true
-          docker exec "$t3_smoke_id" node -e 'const fs=require("node:fs"),assert=require("node:assert/strict");assert.match(fs.readFileSync("/work/.logins/codex/config.toml","utf8"),/bearer_token_env_var = "BRIQ_MCP_TOKEN"/);assert.equal(JSON.parse(fs.readFileSync("/work/.logins/claude/.claude.json","utf8")).mcpServers.briq.headers.Authorization,"Bearer \u0024{BRIQ_MCP_TOKEN}");assert.ok(fs.existsSync("/work/.t3/home/.agents/skills/briq/SKILL.md"));assert.ok(fs.existsSync("/work/.logins/claude/skills/briq/SKILL.md"))'
-
-      # The image fixture exercises Claude tool policy and native Codex MCP turns with fake providers.
-      # No credentials or external model network; this does not qualify cloud or subscription execution.
-      - name: Offline Claude and Codex protocol conformance
-        run: |
-          set -eu
-          claude_probe_id=
-          trap 'if [ -n "$claude_probe_id" ]; then docker rm -fv "$claude_probe_id" > /dev/null 2>&1 || true; fi' EXIT
-          claude_probe_id="$(docker create --network none --cap-drop ALL --security-opt no-new-privileges --read-only --pids-limit 128 --memory 2g --tmpfs /tmp:rw,nosuid,nodev --workdir /tmp --env HOME=/tmp/home --env CLAUDE_CONFIG_DIR=/tmp/home/config --entrypoint /usr/local/bin/node "$T3_IMAGE:${{ needs.image.outputs.tag }}" /opt/t3-cloud/fixtures/claude-alias.mjs /usr/local/bin/claude /tmp/claude-image-result.json)"
-          timeout --signal=TERM --kill-after=5s 155s docker start --attach "$claude_probe_id"
-          test "$(docker inspect --format '{{.State.Status}}:{{.State.ExitCode}}' "$claude_probe_id")" = 'exited:0'
-
+          node-version: 26.12.1
+      - uses: actions/download-artifact@v4
+        with:
+          name: checked-runtime-image
+          path: ${{ runner.temp }}/checked-image
+      # Consume exactly the image which passed the unprivileged image job's probes.
+      - name: Load checked image
+        run: docker load --input "$RUNNER_TEMP/checked-image/image.tar"
       - name: Publish checked image
         id: publish
+        env:
+          CHECKED_IMAGE_ID: ${{ needs.image.outputs.checked_image_id }}
+          TAG: ${{ needs.image.outputs.tag }}
         run: |
           set -euo pipefail
-          docker push "$T3_IMAGE:${{ needs.image.outputs.tag }}"
-          docker tag "$T3_IMAGE:${{ needs.image.outputs.tag }}" "$T3_IMAGE:latest"
-          docker push "$T3_IMAGE:latest"
-          digest="$(docker buildx imagetools inspect "$T3_IMAGE:${{ needs.image.outputs.tag }}" --format '{{json .Manifest}}' | jq -r .digest)"
+          [[ "$CHECKED_IMAGE_ID" =~ ^sha256:[a-f0-9]{64}$ ]]
+          test "$(docker image inspect "$CHECKED_IMAGE_ID" --format '{{.Id}}')" = "$CHECKED_IMAGE_ID"
+          docker tag "$CHECKED_IMAGE_ID" "$T3_IMAGE:$TAG"
+          docker push "$T3_IMAGE:$TAG" > "$RUNNER_TEMP/runtime-push.txt" 2>&1
+          digest="$(node bin/verify-runtime-push.mjs receipt "$RUNNER_TEMP/runtime-push.txt")"
+          # Bind the actual push receipt to the checked config through an immutable
+          # registry lookup. A concurrent writer changing TAG cannot substitute bytes.
+          docker buildx imagetools inspect "$T3_IMAGE@$digest" --raw > "$RUNNER_TEMP/runtime-pushed-manifest.json"
+          node bin/verify-runtime-push.mjs manifest "$RUNNER_TEMP/runtime-pushed-manifest.json" "$CHECKED_IMAGE_ID"
+          docker tag "$CHECKED_IMAGE_ID" "$T3_IMAGE:latest"
+          docker push "$T3_IMAGE:latest" > "$RUNNER_TEMP/runtime-latest-push.txt" 2>&1
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          echo "image_id=$CHECKED_IMAGE_ID" >> "$GITHUB_OUTPUT"
       - name: Attest provenance
         uses: actions/attest-build-provenance@v2
         with:
           subject-name: ${{ env.T3_IMAGE }}
           subject-digest: ${{ steps.publish.outputs.digest }}
+
+      - name: Package published runtime
+        env:
+          BASE: ${{ needs.image.outputs.base }}
+          CHECKED_IMAGE_ID: ${{ steps.publish.outputs.image_id }}
+          DIGEST: ${{ steps.publish.outputs.digest }}
+          SOURCE: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/runtime-image-root"
+          mkdir "$root"
+          image_id="$(docker create "$CHECKED_IMAGE_ID")"
+          trap 'docker rm -v "$image_id" > /dev/null' EXIT
+          docker export "$image_id" | tar -xf - -C "$root"
+          # Normalize the exported snapshot without changing the checked image.
+          bash bin/normalize-runtime-image "$root"
+          node bin/package-runtime-release.mjs "$root" "$RUNNER_TEMP/runtime-release" "${BASE##*@}" "$SOURCE" "$T3_IMAGE@$DIGEST"
+          node bin/check-runtime-release.mjs "$RUNNER_TEMP/runtime-release"
+      - name: Attest exact runtime assets
+        id: runtime-attestation
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            ${{ runner.temp }}/runtime-release/manifest.json
+            ${{ runner.temp }}/runtime-release/runtime-blobs.tar
+      - name: Publish runtime release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SOURCE: ${{ github.sha }}
+          TAG: ${{ needs.image.outputs.tag }}
+          ATTESTATION_BUNDLE: ${{ steps.runtime-attestation.outputs.bundle-path }}
+        run: |
+          set -euo pipefail
+          node --input-type=module -e 'import { copyFile, stat } from "node:fs/promises"; import { join } from "node:path"; const source = process.env.ATTESTATION_BUNDLE; const info = await stat(source); if (!info.isFile() || info.size <= 0 || info.size > 16000000) throw Error("Invalid attestation bundle"); await copyFile(source, join(process.env.RUNNER_TEMP, "runtime-release/runtime-attestation.jsonl"));'
+          # A source-addressed tag prevents accidental replacement; no --clobber.
+          gh release create "runtime-$SOURCE" \
+            "$RUNNER_TEMP/runtime-release/manifest.json" \
+            "$RUNNER_TEMP/runtime-release/runtime-blobs.tar" \
+            "$RUNNER_TEMP/runtime-release/runtime-attestation.jsonl" \
+            --repo briq-cloud/t3-cloud --target "$SOURCE" \
+            --title "Runtime $TAG" --notes "Complete linux/amd64 application runtime. Verify artifact provenance before installation." --latest=false

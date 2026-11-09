@@ -1,11 +1,13 @@
+import { acquireRuntimeOwnership } from './runtime-ownership.mjs';
 import { ClaudeRuntime } from './claude-runtime.mjs';
 import { edgeToken, edgeAuthorized, requireEdgeBinding } from './edge-auth.mjs';
-import { mkdir, open, rm } from 'node:fs/promises';
+import { mkdir } from 'node:fs/promises';
 import { join, isAbsolute } from 'node:path';
 import { WebSocketServer, WebSocket } from 'ws';
 import { AllocationStore, ThreadAllocator, identifier, threadIdentifier, providerInstanceId } from './allocations.mjs';
 import { BriqCloud } from './briq-cloud.mjs';
 import { startAppServer, CapabilityBroker } from './broker.mjs';
+import { runtimePath, runtimePathEnv } from './runtime-paths.mjs';
 import { ScopedBriq } from './scoped-briq.mjs';
 import { ScopedMcpTransport } from './scoped-mcp-transport.mjs';
 
@@ -63,7 +65,10 @@ export async function createCentralRuntime(env = process.env, dependencies = {})
   if (!directory || !isAbsolute(directory)) throw Error('Absolute central state directory required');
   await mkdir(directory, { recursive: true, mode: 0o700 });
   const lock = join(directory, 'central.lock');
-  await mkdir(lock, { mode: 0o700 });
+  const ownership = await (dependencies.acquireOwnership ?? acquireRuntimeOwnership)({ directory, name: 'central',
+    environmentBinding: dependencies.environmentBinding ?? env.T3_CLOUD_OWNER_ID, legacy: lock });
+  if (ownership.evidence === 'cold' && env.T3_CLOUD_RECOVERY === '1') await ownership.reconcile(ownership.revision);
+  else if (!['fresh', 'clean'].includes(ownership.evidence)) { await ownership.close(); throw Error('Central ownership requires reconciliation'); }
   let app, websocket, claude, briqTransport; const peers = new Set(); let stopped = false;
   const bridgeLeases = new Map();
   const closeManagedBridge = binding => {
@@ -78,14 +83,14 @@ export async function createCentralRuntime(env = process.env, dependencies = {})
     websocket?.close(); briqTransport?.close();
     await claude?.close();
     await app?.close();
-    await rm(lock, { recursive: true });
+    await ownership.close({ clean: true });
   }
   try {
-    const handle = await open(join(lock, 'owner.json'), 'wx', 0o600);
-    try { await handle.writeFile(JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString() })); } finally { await handle.close(); }
     const store = new AllocationStore(join(directory, 'allocations')); await store.initialize();
     for (const binding of [...await store.list(), ...await store.listSources()]) if (binding.state !== 'revoked') requireEdgeBinding(binding, edgeCredential);
-    app = await (dependencies.startAppServer ?? startAppServer)({ binary: env.T3_CLOUD_CODEX_BINARY ?? 'codex', home: join(directory, 'codex') });
+    app = await (dependencies.startAppServer ?? startAppServer)({ binary: env.T3_CLOUD_CODEX_BINARY ??
+      (env.T3_RELEASE_ROOT ? runtimePath(env, 'opt/codex/bin/codex') : 'codex'),
+      home: join(directory, 'codex'), ...(env.T3_RELEASE_ROOT ? { path: runtimePathEnv(env) } : {}) });
     const cloud = dependencies.cloud ?? new BriqCloud({ directory: join(directory, 'stacks'), env });
     const scopedBriq = new ScopedBriq({ store, cloud });
     briqTransport = (dependencies.createScopedMcpTransport ?? (options => new ScopedMcpTransport(options)))({ store, scopedBriq, endpoint: `http://127.0.0.1:${env.PORT ?? 8080}/_cloud/briq/mcp` });
@@ -93,13 +98,30 @@ export async function createCentralRuntime(env = process.env, dependencies = {})
     claude = (dependencies.createClaudeRuntime ?? (options => new ClaudeRuntime(options)))({ store, ledger: claudeLedger, cloud, scopedBriq, directory: join(directory, 'claude'), nativeHome: env.HOME, nativeConfigDirectory: env.CLAUDE_CONFIG_DIR });
     const admittedProviders = Object.freeze(['codex', ...(claude.enabled === true ? ['claudeAgent'] : [])]);
     const broker = new CapabilityBroker({ store, app, claude, briqTransport, admittedProviders });
-    let ready = false, restoring, retryRestore = false;
+    let ready = false, restoring, retryRestore = false, draining = false;
     function restore() {
       if (stopped) throw Error('Central runtime stopped');
       if (restoring) return restoring;
       if (ready && !retryRestore) return Promise.resolve();
       retryRestore = false;
       restoring = (async () => {
+        if (env.T3_CLOUD_RECOVERY === '1') {
+          // Owner-approved cold recovery admits new work, but never replays a
+          // persisted provider binding, pending turn, cleanup or login attempt.
+          for (const binding of [...await store.list(), ...await store.listSources()]) {
+            if (binding.state === 'revoked') continue;
+            const source = binding.purpose === 'project-source';
+            const key = source ? binding.projectSource.sourceId : binding.threadId;
+            await store.serialized(source ? `~project-source-${key}` : key, async () => {
+              const current = await store.loadBinding(key, binding.purpose);
+              if (current?.allocationId !== binding.allocationId || current.state === 'revoked') return;
+              current.restoreState = 'reconciliation-required';
+              await store.saveBinding(current);
+            });
+          }
+          ready = true;
+          return;
+        }
         // The manager must bind the loopback MCP route before native restoration.
         for (let binding of await store.list()) {
           if (binding.state === 'revoked') {
@@ -235,7 +257,33 @@ export async function createCentralRuntime(env = process.env, dependencies = {})
         });
       } catch { session?.close(); socket.end('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n'); }
     }
-    return { allocator, broker, admittedProviders, bridgeUpgrade, close, restore, ready: () => ready && !stopped, briqMcpRequest: (req, res) => briqTransport.handle(req, res),
+    async function updateActivity() {
+      // Existing broker ownership and durable ledgers are authoritative. An
+      // unresolved marker is busy even if no process or client is connected.
+      // Durable reads are asynchronous snapshots. Any admitted receive that
+      // starts or settles during this scan invalidates its quiescence proof.
+      const activityGeneration = broker.activityGeneration;
+      let unresolved = 0;
+      for (const binding of [...await store.list(), ...await store.listSources()]) {
+        if (binding.restoreState || ['unknown', 'started'].includes(binding.nativeState) ||
+            binding.turnState === 'unknown' || binding.nativeCleanup && binding.nativeCleanup.state !== 'completed' ||
+            binding.rootStop && binding.rootStop.state !== 'completed') unresolved++;
+        if (binding.purpose === 'project-source') {
+          if (binding.state !== 'ready' && binding.state !== 'revoked' || binding.preparationSession) unresolved++;
+          continue;
+        }
+        unresolved += (await store.mutationMarkers(binding.threadId)).length;
+        unresolved += (await store.listOperations(binding.threadId)).filter(row =>
+          row.method === 'briq/scoped' ? row.state !== 'completed' : row.state !== 'adopted').length;
+      }
+      const counts = { receiving: broker.inflightReceives, activityChanged: Number(activityGeneration !== broker.activityGeneration), activeTurns: broker.activeTurns.size, pendingTurns: broker.pendingTurns.size,
+        mutations: broker.mutations.size, logins: broker.loginPending.size, approvals: broker.approvals.size, serialized: store.active.size,
+        claude: Number(Boolean(claude.owner || claude.metadataOwner)), unresolved,
+        preparations: bridgeLeases.size, restoring: Number(Boolean(restoring)), unavailable: Number(broker.unavailable) };
+      return { idle: Object.values(counts).every(value => value === 0), counts };
+    }
+    return { allocator, broker, admittedProviders, bridgeUpgrade, close, restore, ready: () => ready && !stopped && !draining,
+      drain: () => { draining = true; broker.draining = true; }, updateActivity, briqMcpRequest: (req, res) => briqTransport.handle(req, res),
       claudeCredentialOwner: claude.credentials, briqCredentialOwner: cloud.credentialOwner };
   } catch (error) { await close(); throw error; }
 }

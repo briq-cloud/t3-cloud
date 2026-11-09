@@ -3347,7 +3347,7 @@ index ffe99dd293f39c22f9e05225541c9868625ab81a..a114eb9a188c92dbc2c4309cd289d4e3
 +              enabled: true,
 +              config: {
 +                ...adapterOptions.settings,
-+                binaryPath: "/opt/t3-cloud/bin/claude-unavailable",
++                binaryPath: `${process.env.T3_RELEASE_ROOT ?? ""}/opt/t3-cloud/bin/claude-unavailable`,
 +                homePath: "/work/.claude-empty",
 +              },
 +            }).pipe(
@@ -14786,13 +14786,13 @@ index a944f751a1d342c91bbba1f3728ba7e8315f727f..7dea6855a8fdead14fe4543279876d06
 +    role === "child"
 +      ? entry.driver === "claudeAgent"
 +        ? {
-+            binaryPath: "/opt/t3-cloud/bin/claude-unavailable",
++            binaryPath: `${process.env.T3_RELEASE_ROOT ?? ""}/opt/t3-cloud/bin/claude-unavailable`,
 +            homePath: "/work/.claude-empty",
 +            customModels: [],
 +          }
 +        : {
 +            setupMode: "existing",
-+            binaryPath: "/opt/t3-cloud/bin/codex-remote",
++            binaryPath: `${process.env.T3_RELEASE_ROOT ?? ""}/opt/t3-cloud/bin/codex-remote`,
 +            homePath: "/work/.codex-empty",
 +            shadowHomePath: "",
 +            launchArgs: "",
@@ -21455,7 +21455,7 @@ index 0000000000000000000000000000000000000000..daf7d51f9320fddac10fe317dffe1a5d
 +              shell: false,
 +              extendEnv: false,
 +              env: {
-+                PATH: "/usr/local/bin:/usr/bin:/bin",
++                PATH: process.env.PATH ?? "/usr/local/bin:/usr/bin:/bin",
 +                LANG: "C.UTF-8",
 +                ELECTRON_RUN_AS_NODE: "1",
 +                [MANAGED_BRIDGE_BOOTSTRAP]: bootstrap,

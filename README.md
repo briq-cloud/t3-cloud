@@ -5,7 +5,7 @@ Dockerfile uses the pinned T3 source, runtime versions, and locked dependencies 
 this repository. Pull requests run runtime tests and offline image checks; an
 explicitly dispatched release publishes an immutable date tag and `latest`.
 
-Build locally with `docker build --platform linux/amd64 -t t3-cloud:local .` and run the runtime checks
+Build locally with `docker build --platform linux/amd64 --build-arg SOURCE_COMMIT=$(git rev-parse HEAD) -t t3-cloud:local .` and run the runtime checks
 with `npm ci --ignore-scripts && npm test`. The image build fetches the pinned
 upstream source and verified release artifacts.
 
@@ -125,3 +125,73 @@ Set `T3_CLOUD_NATIVE_ORIGIN` only to the designated secondary HTTPS origin. The 
 Connections exposes pending-code revocation separately from native-session revocation. Clearing a displayed code removes it from the page; use Revoke pending code to invalidate it. Revoking a session uses the native CLI to update T3 access control, then disconnects all public native connections before reporting success. Other authorized clients can reconnect; the revoked session cannot. Private management, terminal and bridge connections stay connected. Signed attachment links are capabilities and may remain usable until expiry. Pairing codes and QR data stay in page memory and clear on expiry, logout, page exit or replacement.
 
 Source checks and synthetic native conformance do not qualify an installed phone or deployment. Release acceptance still requires the official app to pair to the central identity and create two threads with distinct managed workspaces.
+
+### Application runtime activation candidate
+
+The image now has a dependency-free bootstrap loader at `/opt/t3-bootstrap`.
+It keeps ports 8080 and the optional phone port 8081 stable while a manager using
+the selected release's Node and dependencies listens only on 8082/8083.
+The original manager and native frontdoor still enforce authentication, origins,
+headers and WebSocket admission. State, vendor homes and native pairing identity
+keep their existing paths. New allocations use the child image digest from the
+attested release; existing allocations keep their recorded identities.
+
+`RuntimeSupervisor.stageRelease()` accepts local content-addressed blobs and a
+GitHub-attested manifest, checks base OS compatibility, and records its digest.
+`activate()` durably records the desired release before fencing admission;
+`completeDrain()` can finish a live pending drain. The manager checks its actual
+broker turns, pending mutations, allocation ledgers and process ownership before
+shutdown. Standalone activation is unavailable without a trustworthy native idle
+interface. Using the terminal also blocks automatic activation for that process
+lifetime, since the current terminal offers no proof that background work ended.
+
+Every selected release is rehashed before execution. Read-only staged files are
+an accident guard; the same OS user can change their permissions, so the digest
+check is still required. The manifest pins the sandbox base OS digest; an
+incompatible base requires an explicit image/bootstrap upgrade. The bootstrap
+verifier stays in the base image and cannot be replaced by an application bundle.
+
+The journal records staged, desired, current, phase and activation receipt with
+atomic rename and fsync. Admission opens after native HTTP and broker health
+checks and the committed receipt. An interrupted transition, unclean process
+restart, stale loader lock or failed new runtime stays closed for explicit
+reconciliation. The loader never kills a persisted PID, replays a native turn,
+or automatically rolls back after a possible state migration.
+
+This local candidate includes owner-authenticated update discovery and download,
+manual and opt-in automatic updates, explicit recovery controls, and a release-owned
+controller. Installing the bootstrap into an existing home and proving it survives
+real sandbox cold boots are incomplete. No production or staging rollout, official-phone update,
+GitHub attestation verification against a published release, or end-to-end cloud
+activation has been qualified by these tests.
+
+### Initial bootstrap migration
+
+An existing home that predates the loader requires a one-time image replacement.
+The application helper only prepares durable evidence; it does not replace an
+image or install files into the root filesystem.
+
+Before stopping the old runtime, place a published runtime manifest, its
+`runtime-attestation.jsonl`, and content-addressed `blobs/` under the fixed
+`$T3_CLOUD_STATE/updates/bootstrap-input/` directory. Run
+`node bin/prepare-bootstrap-migration.mjs` with the existing protected
+`T3_CLOUD_OWNER_ID` and `T3_CLOUD_CHILD_IMAGE` deployment values and the pinned
+target `T3_CLOUD_BOOTSTRAP_BASE_IMAGE` digest. The helper accepts no arguments,
+verifies the publisher attestation and staged bytes, and refuses existing loader
+or activation history. It inventories only the two legacy lock directories;
+login, pairing and native session files are never read.
+
+After image replacement, refresh the deployment's `T3_CLOUD_CHILD_IMAGE` to the
+actual replacement digest. Keep the same durable home and owner binding. The new
+loader serves only the owner management page until the owner explicitly chooses
+**Install prepared runtime and quarantine old bindings**. Recovery requires a
+changed kernel boot, matching replacement image/source/base, unchanged legacy
+evidence, and the exact prepared runtime. Legacy lock directories are renamed
+into migration evidence, never deleted. The selected release becomes the initial
+installation with no fabricated activation receipt. Existing bindings remain
+quarantined; recovery never replays native work, signs in or pairs a device.
+
+If recovery fails, preserve the receipt, activation journal and evidence.
+Unknown process outcomes keep admission closed. A subsequent changed boot can
+resume the same migration operation; contradictory history requires inspection.
+Local tests do not qualify an existing home's filesystem or phone continuity.

@@ -1,3 +1,4 @@
+import { testOwnership } from './fixtures/runtime-ownership.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { startManager } from './manager-main.mjs';
@@ -78,7 +79,7 @@ test('manager restart launches recovery UI and device sign-in despite persisted 
   throw Error('Unexpected native effect');
  }};
  const runtime=await startManager(env,{
-  centralRuntime:async value=>(central=await createCentralRuntime(value,{startAppServer:async()=>app,cloud:{}})),
+  centralRuntime:async value=>(central=await createCentralRuntime(value,{acquireOwnership:testOwnership,startAppServer:async()=>app,cloud:{}})),
   spawnProcess:()=>{spawned++;const child=new EventEmitter();child.kill=()=>true;return child;},
  });managed=runtime;
  assert.equal(central.ready(),true);assert.equal(spawned,2);assert.equal((await store.load('t3')).restoreState,'deferred');
@@ -94,4 +95,26 @@ test('optional native transport fails closed before effects for invalid or prima
  const env={T3_CLOUD_PUBLIC_ORIGIN:'https://private.example',T3_CLOUD_OWNER_KEY:'owner-key-test-only-at-least-32-bytes',T3_CLOUD_OWNER_ID:'owner',T3_CLOUD_EDGE_TOKEN:'e'.repeat(32)};
  for(const native of ['https://private.example','http://native.example','https://native.example/path'])await assert.rejects(startManager({...env,T3_CLOUD_NATIVE_ORIGIN:native},{centralRuntime:async()=>{started++;}}),/origin/);
  assert.equal(started,0);
+});
+
+test('manager proves activity before drain and keeps owner update status available after fencing native admissions', async t => {
+ const {createServer}=await import('node:net');const {once,EventEmitter}=await import('node:events');
+ const probe=createServer();probe.listen(0,'127.0.0.1');await once(probe,'listening');const port=probe.address().port;await new Promise(resolve=>probe.close(resolve));
+ let idle=true,drained=0,providerCalls=0;
+ const key='owner-key-test-only-at-least-32-bytes';const origin='https://cloud.example';
+ const manager=await startManager({PORT:String(port),T3_HOST:'127.0.0.1',T3_CLOUD_PUBLIC_ORIGIN:origin,T3_CLOUD_OWNER_KEY:key,T3_CLOUD_OWNER_ID:'owner',T3_CLOUD_EDGE_TOKEN:'e'.repeat(32)}, {
+  centralRuntime:async()=>({allocator:{allocate(){}},broker:{ownerRequest(){}},ready:()=>!drained,drain:()=>{drained++;},
+   updateActivity:async()=>({idle}),briqMcpRequest:(_req,res)=>{providerCalls++;res.end('{}');},close:async()=>{}}),
+  updates:{status:async()=>({phase:drained?'draining':'running'}),check:async()=>({}),update:async()=>({}),automatic:async()=>({})},
+  spawnProcess:()=>{const child=new EventEmitter();child.kill=()=>true;return child;},
+ });t.after(()=>manager.close());
+ assert.equal((await manager.activity()).idle,true);
+ idle=false;assert.equal((await manager.activity()).idle,false);idle=true;
+ await manager.drain();assert.equal(drained,1);
+ const status=await fetch(`http://127.0.0.1:${port}/_cloud/updates/status`,{headers:{authorization:`Bearer ${key}`}});
+ assert.equal(status.status,200);assert.equal((await status.json()).phase,'draining');
+ for(const path of ['/_cloud/threads','/_cloud/briq/mcp','/_cloud/terminal/','/native']) {
+  const response=await fetch(`http://127.0.0.1:${port}${path}`);assert.equal(response.status,503);await response.text();
+ }
+ assert.equal(providerCalls,0);assert.equal((await manager.activity()).idle,true);
 });

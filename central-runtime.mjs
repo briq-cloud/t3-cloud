@@ -108,13 +108,15 @@ export async function createCentralRuntime(env = process.env, dependencies = {})
         if (env.T3_CLOUD_RECOVERY === '1') {
           // Owner-approved cold recovery admits new work, but never replays a
           // persisted provider binding, pending turn, cleanup or login attempt.
-          for (const binding of await store.list()) {
-            if (binding.state !== 'ready') continue;
-            await store.serialized(binding.threadId, async () => {
-              const current = await store.load(binding.threadId);
-              if (current?.allocationId !== binding.allocationId || current.state !== 'ready') return;
+          for (const binding of [...await store.list(), ...await store.listSources()]) {
+            if (binding.state === 'revoked') continue;
+            const source = binding.purpose === 'project-source';
+            const key = source ? binding.projectSource.sourceId : binding.threadId;
+            await store.serialized(source ? `~project-source-${key}` : key, async () => {
+              const current = await store.loadBinding(key, binding.purpose);
+              if (current?.allocationId !== binding.allocationId || current.state === 'revoked') return;
               current.restoreState = 'reconciliation-required';
-              await store.save(current);
+              await store.saveBinding(current);
             });
           }
           ready = true;

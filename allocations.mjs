@@ -203,6 +203,7 @@ export class ThreadAllocator {
       if (binding?.state === 'revoked') throw Error('Allocation revoked');
       if (binding && (managedBridge ? binding.managedBridge?.ownerGeneration !== managedBridge.ownerGeneration : binding.managedBridge !== undefined))
         throw Error('Immutable allocation mode mismatch');
+      if (binding?.restoreState) throw Error('Allocation requires explicit reconciliation');
       if (binding) {
         requireEdgeBinding(binding, this.edgeCredential);
         if (binding.providerInstanceId === undefined) { binding.providerInstanceId = provider; await this.store.save(binding); }
@@ -250,6 +251,7 @@ export class ThreadAllocator {
       let binding = await this.store.loadSource(key);
       if (binding && (binding.ownerId !== ownerId || binding.managedBridge.ownerGeneration !== generation ||
           canonicalJson(binding.projectSource) !== canonicalJson(source))) throw Error('Immutable source allocation mismatch');
+      if (binding?.restoreState) throw Error('Source allocation requires explicit reconciliation');
       if (binding) requireEdgeBinding(binding, this.edgeCredential);
       if (!binding) {
         binding = { version: 1, purpose: 'project-source', ownerId, projectSource: source, managedBridge: { ownerGeneration: generation },

@@ -403,3 +403,42 @@ test('owner-approved cold recovery preserves unknown bindings with zero native, 
  const persisted=await store.load('t3');assert.equal(persisted.nativeThreadId,'native');assert.equal(persisted.nativeState,'unknown');assert.equal(persisted.turnState,'unknown');assert.equal(persisted.restoreState,'reconciliation-required');
  assert.deepEqual(await runtime.allocator.phoneChildren('owner'),[]);
 });
+
+
+test('cold recovery quarantines allocation retries and source admission while fresh work stays available', async t => {
+ const f=await fixture(t);const store=new AllocationStore(join(f.directory,'allocations'));await store.initialize();
+ const source={version:1,sourceId:'source-recovered-123456',hostProjectId:'project',logicalRoot:'/projects/source-recovered-123456',clone:{remoteUrl:'https://github.com/up-lab/example.git',protocol:'https'}};
+ source.sourceDigest=digest(canonicalJson(source));
+ const common={ownerId:'owner',edgeTokenHash:digest(f.env.T3_CLOUD_EDGE_TOKEN),allocationId:'allocation',projectId:'project',state:'ready'};
+ for(const state of ['ready','created','creating','unknown']) {
+  await store.save({...common,state,threadId:`old-${state}`,providerInstanceId:'codex',nativeThreadId:'native',nativeState:'unknown',turnState:'unknown'});
+  const projectSource={...source,sourceId:`source-${state}-123456789`,logicalRoot:`/projects/source-${state}-123456789`};
+  delete projectSource.sourceDigest;projectSource.sourceDigest=digest(canonicalJson(projectSource));
+  await store.saveSource({...common,state,purpose:'project-source',projectSource,managedBridge:{ownerGeneration:'generation'}});
+ }
+ const external=[];
+ const cloud={
+  create:async binding=>{external.push('create');return{id:'child',stackId:'stack'};},
+  find:async()=>{external.push('find');return{id:'child',stackId:'stack'};},
+  endpoints:async()=>{external.push('endpoints');return{t3Url:'https://child.example',execUrl:'wss://child.example/_cloud/exec'};},
+  descriptor:async()=>{external.push('descriptor');return{environmentId:'environment'};},
+  pair:async()=>{external.push('pair');return'credential';},
+ };
+ const runtime=await createCentralRuntime({...f.env,T3_CLOUD_RECOVERY:'1'},{...f.deps,cloud});f.runtimes.push(runtime);
+ await runtime.restore();
+ for(const state of ['ready','created','creating','unknown']) {
+  const binding=await store.load(`old-${state}`),sourceBinding=await store.loadSource(`source-${state}-123456789`);
+  assert.equal(binding.state,state);assert.equal(sourceBinding.state,state);
+  assert.equal(binding.restoreState,'reconciliation-required');assert.equal(sourceBinding.restoreState,'reconciliation-required');
+  await assert.rejects(runtime.allocator.allocate('owner',binding.threadId,'codex'),/explicit reconciliation/);
+  await assert.rejects(runtime.allocator.allocateSource('owner',sourceBinding.projectSource,'generation'),/explicit reconciliation/);
+  assert.deepEqual(await store.load(binding.threadId),binding);assert.deepEqual(await store.loadSource(sourceBinding.projectSource.sourceId),sourceBinding);
+ }
+ assert.deepEqual(external,[]);assert.deepEqual(f.calls,[]);
+ const fresh=await runtime.allocator.allocate('owner','fresh-thread','codex');
+ assert.equal(fresh.connection.credential,'credential');assert.deepEqual(external,['create','endpoints','descriptor','pair']);
+ assert.deepEqual(f.calls.map(call=>call.method),['environment/add']);
+ external.length=0;f.calls.length=0;
+ const freshSource=await runtime.allocator.allocateSource('owner',source,'generation');
+ assert.equal(freshSource.sourceId,source.sourceId);assert.deepEqual(external,['create','endpoints','descriptor']);assert.deepEqual(f.calls,[]);
+});

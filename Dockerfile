@@ -103,6 +103,7 @@ RUN curl -fsSL https://github.com/pingdotgg/t3code/releases/download/v0.1.6/t3-0
   && cp -a /tmp/t3-release/resource-monitor /out/t3/
 
 FROM native-clis AS t3-cloud
+LABEL org.opencontainers.image.source="https://github.com/briq-cloud/t3-cloud"
 ARG BASE
 RUN printf '%s\n' "${BASE##*@}" > /etc/t3-cloud/base-image
 COPY --from=t3-source /out/t3 /opt/t3

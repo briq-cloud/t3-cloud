@@ -50,6 +50,27 @@ test('packaging preserves relative release shims, deployed SDK and npm CLI symli
   assert.deepEqual(manifest.files.find(entry => entry.path === 'opt/t3-cloud/bin/release-shims/node'), { path: 'opt/t3-cloud/bin/release-shims/node', type: 'symlink', target: 'runtime-command' });
   await run(process.execPath, [new URL('./check-runtime-release.mjs', import.meta.url).pathname, f.output]);
 });
+test('pinned Linux resource monitor directory packs only with its required executable', async t => {
+  const f = await imageFixture(t);
+  const monitor = 'opt/t3/resource-monitor/linux-x64/t3-resource-monitor';
+  assert.equal((await lstat(join(f.root, 'opt/t3/resource-monitor'))).isDirectory(), true);
+  await chmod(join(f.root, monitor), 0o755);
+  assert.equal(await packageRuntimeRelease(f), null);
+  const manifest = JSON.parse(await readFile(join(f.output, 'manifest.json'), 'utf8'));
+  assert.deepEqual(manifest.files.filter(entry => entry.path.startsWith('opt/t3/resource-monitor')).map(({ path, type }) => ({ path, type })), [
+    { path: 'opt/t3/resource-monitor', type: 'directory' },
+    { path: 'opt/t3/resource-monitor/linux-x64', type: 'directory' },
+    { path: monitor, type: 'file' },
+  ]);
+  await run(process.execPath, [new URL('./check-runtime-release.mjs', import.meta.url).pathname, f.output]);
+  await chmod(join(f.root, monitor), 0o644);
+  assert.deepEqual(await packageRuntimeRelease({ ...f, output: `${f.output}-not-executable` }), { stage: 'inventory', category: 'missing-required-entry' });
+  await rm(join(f.root, monitor));
+  assert.deepEqual(await packageRuntimeRelease({ ...f, output: `${f.output}-missing` }), { stage: 'inventory', category: 'missing-required-entry' });
+  await mkdir(join(f.root, monitor), { mode: 0o700 });
+  assert.deepEqual(await packageRuntimeRelease({ ...f, output: `${f.output}-directory` }), { stage: 'inventory', category: 'missing-required-entry' });
+});
+
 for (const [kind, expected] of [
   ['missing input', 'stage=inventory category=missing-entry'],
   ['absolute link', 'stage=inventory category=unsafe-link'],

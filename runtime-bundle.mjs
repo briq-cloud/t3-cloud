@@ -16,8 +16,10 @@ const safePath = value => typeof value === 'string' && value.length <= 512 && va
   normalize(value) === value;
 const inside = (root, path) => path === root || path.startsWith(root + sep);
 
+const resourceMonitorPath = 'opt/t3/resource-monitor/linux-x64/t3-resource-monitor';
 export const REQUIRED_BUNDLE_PATHS = Object.freeze([
-  'opt/t3/t3', 'opt/t3/node', 'opt/t3/source.json', 'opt/t3/resource-monitor',
+  'opt/t3/t3', 'opt/t3/node', 'opt/t3/source.json',
+  resourceMonitorPath,
   'opt/t3/dist/bin.mjs', 'opt/t3/node_modules/@anthropic-ai/claude-agent-sdk/manifest.json',
   'opt/t3-cloud/manager-main.mjs', 'opt/t3-cloud/prepare.mjs',
   'opt/t3-cloud/runtime-controller.mjs', 'opt/t3-cloud/runtime-controller-process.mjs', 'opt/t3-cloud/runtime-updates.mjs',
@@ -102,7 +104,10 @@ export async function inventoryBundle(root, paths = BUNDLE_ROOTS) {
   const names = new Set(entries.map(entry => entry.path));
   if (names.size !== entries.length) throw Error('Duplicate release path');
   for (const path of REQUIRED_BUNDLE_PATHS) {
-    try { if (resolveBundlePath(entries, path)?.type !== 'file') throw Error(); }
+    try {
+      const entry = resolveBundlePath(entries, path);
+      if (entry?.type !== 'file' || (path === resourceMonitorPath && !(entry.mode & 0o111))) throw Error();
+    }
     catch { throw Error(`Incomplete release: ${path}`); }
   }
   return entries.sort((a, b) => a.path.localeCompare(b.path));
@@ -133,7 +138,10 @@ export function validateManifest(manifest) {
   if (total > 4_000_000_000) throw Error('Release exceeds capacity limit');
   for (const entry of manifest.files) if (entry.type === 'symlink') resolveBundlePath(manifest.files, entry.path);
   for (const path of REQUIRED_BUNDLE_PATHS) {
-    try { if (resolveBundlePath(manifest.files, path)?.type !== 'file') throw Error(); }
+    try {
+      const entry = resolveBundlePath(manifest.files, path);
+      if (entry?.type !== 'file' || (path === resourceMonitorPath && !(entry.mode & 0o111))) throw Error();
+    }
     catch { throw Error(`Incomplete release: ${path}`); }
   }
   const types = new Map(manifest.files.map(entry => [entry.path, entry.type]));

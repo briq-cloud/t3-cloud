@@ -75,6 +75,17 @@ test('incomplete inventory and unsafe paths fail validation', () => {
   assert.throws(() => validateManifest(traversal), /Invalid release path/);
 });
 
+test('manifest requires the Linux resource monitor file beneath its release directories', () => {
+  const path = 'opt/t3/resource-monitor/linux-x64/t3-resource-monitor';
+  const manifest = fixture();
+  assert.equal(manifest.files.find(entry => entry.path === 'opt/t3/resource-monitor').type, 'directory');
+  assert.match(validateManifest(manifest), /^sha256:/);
+  manifest.files.find(entry => entry.path === path).mode = 0o644;
+  assert.throws(() => validateManifest(manifest), /Incomplete release/);
+  manifest.files = manifest.files.map(entry => entry.path === path ? { path, type: 'directory', mode: 0o700 } : entry);
+  assert.throws(() => validateManifest(manifest), /Incomplete release/);
+});
+
 test('bad blob never creates a visible release', async t => {
   const root = await mkdtemp(join(tmpdir(), 't3-release-'));
   t.after(() => cleanup(root));

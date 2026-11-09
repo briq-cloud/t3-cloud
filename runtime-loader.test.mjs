@@ -1,21 +1,22 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile, mkdir, open, lstat, readlink, readdir, chmod } from 'node:fs/promises';
 import { createServer, connect } from 'node:net';
 import { once } from 'node:events';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, dirname } from 'node:path';
 import { acquireRuntimeOwnership } from './runtime-ownership.mjs';
 import { testIdentity, testLock, testOwnership } from './fixtures/runtime-ownership.mjs';
 import { startLoader } from './runtime-loader.mjs';
-import { prepareBootstrapMigration, recoverBootstrapMigration } from './runtime-bootstrap-migration.mjs';
+import { prepareBootstrapMigration, prepareBootstrapMetadata, recoverBootstrapMigration } from './runtime-bootstrap-migration.mjs';
 import { createHash } from 'node:crypto';
 import { runtimeProcess } from './runtime-process.mjs';
 import { runtimeControllerProcess } from './runtime-controller-process.mjs';
 import { RuntimeSupervisor } from './runtime-supervisor.mjs';
 import { RuntimeUpdates } from './runtime-updates.mjs';
 import { createCloudManager } from './manager.mjs';
+import { REQUIRED_BUNDLE_PATHS, validateManifest, verifyManifestAttestation, stageImageBundle, verifyInstalledBundle } from './runtime-bundle.mjs';
 
 const key = 'owner-key-for-integration-test-1234567890123456';
 const origin = 'https://cloud.example';
@@ -32,6 +33,10 @@ async function fixture(t, { recovery = false, unknown = false, journal, ownershi
     try { await loader?.close(); } catch (error) { if (!expectedCloseFailure) throw error; }
     finally {
       if (expectedCloseFailure) await loader?.supervisor.driver.stop();
+      if (bootstrapMigration === 'metadata') {
+        const unseal = async path => { if (!(await lstat(path)).isDirectory()) return; await chmod(path, 0o700); for (const name of await readdir(path)) await unseal(join(path, name)); };
+        await unseal(state);
+      }
       await rm(state, { recursive: true, force: true });
     }
   });
@@ -87,24 +92,50 @@ async function fixture(t, { recovery = false, unknown = false, journal, ownershi
       } });`);
   }
   const childImage = `ghcr.io/briq-cloud/t3-cloud@sha256:${'e'.repeat(64)}`;
-  const manifest = { source, childImage, files: [{ path: 'opt/t3-cloud/runtime-recovery.json', type: 'file', sha256: createHash('sha256').update('{"protocol":1,"persistedBindings":"quarantine"}\n').digest('hex') }] };
+  let selectedIdentity = identity, materialize;
+  let manifest = { source, childImage, files: [{ path: 'opt/t3-cloud/runtime-recovery.json', type: 'file', sha256: createHash('sha256').update('{"protocol":1,"persistedBindings":"quarantine"}\n').digest('hex') }] };
   const migratedOwnership = options => acquireRuntimeOwnership({ ...options, lock: testLock, identity: async () => ({ ...testIdentity, bootId: '22222222-2222-2222-2222-222222222222' }) });
   if (bootstrapMigration) {
     const { mkdir } = await import('node:fs/promises'); await mkdir(join(state, 'central.lock'));
     await writeFile(sourceFile, source);
+    const preparationEnv = { T3_CLOUD_STATE: state, T3_CLOUD_OWNER_ID: 'owner', T3_CLOUD_CHILD_IMAGE: `ghcr.io/briq-cloud/t3-cloud@sha256:${'f'.repeat(64)}`, T3_CLOUD_BOOTSTRAP_BASE_IMAGE: `sha256:${'c'.repeat(64)}` };
+    if (bootstrapMigration === 'metadata') {
+      const imageRoot = join(state, 'image-fixture'), metadataInput = join(state, 'updates/bootstrap-image-input');
+      await mkdir(metadataInput, { recursive: true });
+      const paths = [...REQUIRED_BUNDLE_PATHS, 'opt/t3-cloud/runtime-recovery.json'], directories = new Set();
+      for (const path of paths) for (let parent = dirname(path); parent !== '.'; parent = dirname(parent)) directories.add(parent);
+      const files = [...directories].map(path => ({ path, type: 'directory', mode: 0o700 }));
+      for (const path of paths) {
+        const bytes = Buffer.from(path.endsWith('runtime-recovery.json') ? '{"protocol":1,"persistedBindings":"quarantine"}\n' : 'signed image fixture');
+        files.push({ path, type: 'file', mode: 0o700, size: bytes.length, sha256: createHash('sha256').update(bytes).digest('hex') });
+        await mkdir(dirname(join(imageRoot, path)), { recursive: true, mode: 0o700 });
+        await writeFile(join(imageRoot, path), bytes, { mode: 0o700 });
+      }
+      manifest = { protocol: 1, project: 'briq-cloud/t3-cloud', platform: 'linux/amd64', source, childImage, baseImage: preparationEnv.T3_CLOUD_BOOTSTRAP_BASE_IMAGE,
+        files: files.sort((a, b) => a.path.localeCompare(b.path)) };
+      selectedIdentity = validateManifest(manifest);
+      await writeFile(join(metadataInput, 'manifest.json'), JSON.stringify(manifest));
+      await writeFile(join(metadataInput, 'runtime-attestation.jsonl'), 'signed fixture evidence');
+      const run = async () => ({ stdout: JSON.stringify([{ verificationResult: { signature: { certificate: { sourceRepositoryIdentifier: '1450999885', sourceRepositoryRef: 'refs/heads/main' } } } }]) });
+      await prepareBootstrapMetadata(preparationEnv, { identity: async () => testIdentity, verifyManifest: file => verifyManifestAttestation(file, { run }) });
+      materialize = (file, releases, options) => stageImageBundle(file, releases, { ...options, run,
+        imageFs: { lstat: path => lstat(join(imageRoot, path)), readlink: path => readlink(join(imageRoot, path)), open: (path, flags) => open(join(imageRoot, path), flags) },
+        space: async () => ({ bsize: 1n, bavail: 8n * 1073741824n, files: 100000n, ffree: 100000n }) });
+    } else {
     await prepareBootstrapMigration({ T3_CLOUD_STATE: state, T3_CLOUD_OWNER_ID: 'owner', T3_CLOUD_CHILD_IMAGE: `ghcr.io/briq-cloud/t3-cloud@sha256:${'f'.repeat(64)}`, T3_CLOUD_BOOTSTRAP_BASE_IMAGE: `sha256:${'c'.repeat(64)}` }, {
       identity: async () => testIdentity, stage: async () => ({ identity, path: '/staged-fixture' }), verify: async () => ({ ...manifest, baseImage: `sha256:${'c'.repeat(64)}` }) });
+    }
   }
   let starts = 0, updateWork, controllerWork, controllerTerminal; const recoveries = [], controllers = [];
   const port = await unusedPort();
   loader = await startLoader({ PORT: String(port), T3_HOST: '127.0.0.1', T3_CWD: state, T3_CLOUD_STATE: state,
     T3_CLOUD_PUBLIC_ORIGIN: origin, T3_CLOUD_OWNER_KEY: key, T3_CLOUD_OWNER_ID: 'owner', T3_CLOUD_CHILD_IMAGE: childImage }, {
     baseImageFile, sourceFile, acquireOwnership: bootstrapMigration ? migratedOwnership : ownershipEvidence ? options => acquireRuntimeOwnership({ ...options, lock: testLock, identity: async () => ({ ...testIdentity, ...(ownershipEvidence === 'cold' ? { bootId: '22222222-2222-2222-2222-222222222222' } : {}) }) }) : testOwnership,
-    recoverMigration: options => recoverBootstrapMigration({ ...options, identity: async () => ({ ...testIdentity, bootId: '22222222-2222-2222-2222-222222222222' }), acquireOwnership: migratedOwnership }),
+    recoverMigration: options => recoverBootstrapMigration({ ...options, identity: async () => ({ ...testIdentity, bootId: '22222222-2222-2222-2222-222222222222' }), acquireOwnership: migratedOwnership, ...(materialize ? { materialize } : {}) }),
     createDriver: env => runtimeProcess(env, { spawnProcess: (_command, _args, options) => {
       starts++; recoveries.push(options.env.T3_CLOUD_RECOVERY); return spawn(process.execPath, [childFile], options);
     } }),
-    createSupervisor: options => new RuntimeSupervisor({ ...options, verify: async () => manifest, stage: async () => ({ identity }) }),
+    createSupervisor: options => new RuntimeSupervisor({ ...options, verify: bootstrapMigration === 'metadata' ? verifyInstalledBundle : async () => manifest, stage: async () => ({ identity }) }),
     createUpdates: options => {
       controllerTerminal = options.onTerminal;
       if (releaseController) {
@@ -131,7 +162,7 @@ async function fixture(t, { recovery = false, unknown = false, journal, ownershi
     const text = await response.text();
     return { status: response.status, headers: response.headers, text, value: (() => { try { return JSON.parse(text); } catch { return null; } })() };
   };
-  return { state, port, loader, send, recoveries, controllers, controllerTerminal: () => controllerTerminal(), waitController: async () => { await new Promise(resolve => setImmediate(resolve)); await controllerWork; }, starts: () => starts, waitUpdate: async () => { await new Promise(resolve => setImmediate(resolve)); await updateWork; } };
+  return { state, port, loader, send, recoveries, controllers, selectedIdentity, controllerTerminal: () => controllerTerminal(), waitController: async () => { await new Promise(resolve => setImmediate(resolve)); await controllerWork; }, starts: () => starts, waitUpdate: async () => { await new Promise(resolve => setImmediate(resolve)); await updateWork; } };
 }
 
 test('authenticated owner update crosses real IPC; drain status stays available and committed receipt survives manager replacement', async t => {
@@ -295,4 +326,28 @@ test('prepared bootstrap migration stays management-only until owner action cros
   assert.equal(journal.current, identity); assert.equal(journal.receipt, null); assert.ok(journal.initialInstall);
   const receipt = JSON.parse(await readFile(join(f.state, 'updates/bootstrap-migration.json'), 'utf8'));
   assert.equal(receipt.phase, 'completed'); assert.equal(f.loader.supervisor.admitting, true);
+});
+
+
+test('protocol-2 metadata migration crosses real management parser, read-only controller and fenced loader before explicit recovery', async t => {
+  const f = await fixture(t, { bootstrapMigration: 'metadata', releaseController: true });
+  const receiptFile = join(f.state, 'updates/bootstrap-migration.json');
+  assert.equal(JSON.parse(await readFile(receiptFile, 'utf8')).phase, 'metadata-prepared');
+  assert.equal(f.starts(), 0); assert.equal((await f.send('/native')).status, 503);
+  assert.equal((await f.send('/_cloud/updates/update', { method: 'POST' })).status, 503);
+  await assert.rejects(f.loader.updates.check(), /unavailable/);
+  const status = (await f.send('/_cloud/updates/status')).value;
+  const input = { action: 'recover-bootstrap-migration', expectedMigrationId: status.recovery.migration.id,
+    expectedMigrationRevision: status.recovery.migration.revision, expectedJournalRevision: status.recovery.journalRevision,
+    expectedOwnershipRevision: status.recovery.ownershipRevision };
+  assert.equal((await f.send('/_cloud/updates/reconcile', { method: 'POST', input, auth: false })).status, 401);
+  assert.equal((await f.send('/_cloud/updates/reconcile', { method: 'POST', input, requestOrigin: 'https://evil.example' })).status, 403);
+  assert.equal((await f.send('/_cloud/updates/reconcile', { method: 'POST', input: { ...input, imageRoot: '/tmp/other' } })).status, 400);
+  assert.equal((await f.send('/_cloud/updates/reconcile', { method: 'POST', input: { ...input, expectedMigrationRevision: 99 } })).status, 503);
+  assert.equal(f.starts(), 0);
+  const response = await f.send('/_cloud/updates/reconcile', { method: 'POST', input });
+  assert.equal(response.status, 200); assert.equal(f.starts(), 1); assert.deepEqual(f.recoveries, ['1']);
+  assert.equal(f.loader.supervisor.journal.current, f.selectedIdentity);
+  assert.equal(JSON.parse(await readFile(receiptFile, 'utf8')).phase, 'completed');
+  assert.equal(f.loader.supervisor.admitting, true);
 });

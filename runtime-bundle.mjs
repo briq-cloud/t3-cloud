@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { constants } from 'node:fs';
-import { chmod, copyFile, lstat, mkdir, mkdtemp, open, readFile, readlink, readdir, rename, rm, stat, symlink, writeFile } from 'node:fs/promises';
+import { chmod, copyFile, lstat, mkdir, mkdtemp, open, readFile, readlink, readdir, rename, rm, stat, statfs, symlink, writeFile } from 'node:fs/promises';
 import { dirname, isAbsolute, join, normalize, resolve, sep } from 'node:path';
 import { tmpdir } from 'node:os';
 import { promisify } from 'node:util';
@@ -242,6 +242,65 @@ export async function packBundle(root, output, { baseImage, source, childImage, 
 export async function stageBundle(manifestFile, blobs, releases, options) {
   const { manifest, identity } = await verifyManifestAttestation(manifestFile, options);
   if (!isAbsolute(blobs) || !isAbsolute(releases)) throw Error('Absolute release directories required');
+  return stageVerifiedBundle(manifest, identity, releases, options,
+    (entry, target) => copyFile(join(blobs, entry.sha256), target, constants.COPYFILE_EXCL));
+}
+
+// Initial migration only: fixed image paths are candidate bytes, never authority.
+// Dependency injection supplies filesystem fixtures; recovery accepts no source path.
+export async function stageImageBundle(manifestFile, releases, options = {}) {
+  const { manifest, identity } = await verifyManifestAttestation(manifestFile, options);
+  if (!isAbsolute(releases)) throw Error('Absolute release directories required');
+  if (identity !== options.expectedIdentity || manifest.source !== options.expectedSource || manifest.childImage !== options.expectedImage || manifest.baseImage !== options.expectedBase)
+    throw Error('Image materialization identity mismatch');
+  await mkdir(releases, { recursive: true, mode: 0o700 });
+  if (!(await lstat(releases)).isDirectory()) throw Error('Unsafe release directory');
+  const imageFs = options.imageFs ?? { lstat, open, readlink };
+  const checkEntry = async entry => {
+    const included = BUNDLE_ROOTS.some(root => entry.path === root || entry.path.startsWith(root + '/'));
+    if (!included && !BUNDLE_ROOTS.some(root => root.startsWith(entry.path + '/')))
+      throw Error('Image release path outside application roots');
+    for (let parent = dirname(entry.path); parent !== '.'; parent = dirname(parent)) {
+      if (!(await imageFs.lstat(join('/', parent))).isDirectory()) throw Error('Unsafe image parent');
+    }
+    const info = await imageFs.lstat(join('/', entry.path));
+    if (entry.type === 'symlink') {
+      if (!info.isSymbolicLink() || await imageFs.readlink(join('/', entry.path)) !== entry.target) throw Error('Image release link mismatch');
+    // Synthetic ancestors use canonical inventory modes; application entries
+    // must have their exact signed source modes before sealing.
+    } else if ((!included ? entry.type !== 'directory' || entry.mode !== 0o700 || info.mode & 0o022 : (info.mode & 0o777) !== entry.mode) || (entry.type === 'directory' ? !info.isDirectory() : !info.isFile() || info.nlink !== 1 || info.size !== entry.size))
+      throw Error('Image release entry mismatch');
+  };
+  const copy = async (entry, target) => {
+    const source = await imageFs.open(join('/', entry.path), constants.O_RDONLY | constants.O_NOFOLLOW);
+    let output;
+    try {
+      const info = await source.stat();
+      if (!info.isFile() || info.nlink !== 1 || info.size !== entry.size || (info.mode & 0o777) !== entry.mode) throw Error('Image release file mismatch');
+      output = await open(target, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
+      const bytes = Buffer.alloc(65536); let position = 0;
+      for (;;) {
+        const { bytesRead } = await source.read(bytes, 0, bytes.length, position);
+        if (!bytesRead) break;
+        position += bytesRead; if (position > entry.size) throw Error('Image release file changed');
+        for (let offset = 0; offset < bytesRead;) offset += (await output.write(bytes, offset, bytesRead - offset)).bytesWritten;
+      }
+      if (position !== entry.size) throw Error('Image release file changed');
+    } finally { await output?.close(); await source.close(); }
+  };
+  return stageVerifiedBundle(manifest, identity, releases, { ...options, reuseVerifiedExisting: true, preserveTemporary: true, checkEntry,
+    beforeStage: async destination => {
+      if ((await readdir(releases)).some(name => name.startsWith(destination.split('/').at(-1) + '.staging-')))
+        throw Error('Interrupted image materialization requires inspection');
+      const installed = manifest.files.reduce((n, entry) => n + (entry.type === 'file' ? BigInt(entry.size) : 0n), 0n);
+      const required = installed + (installed + 9n) / 10n + 3n * 1073741824n;
+      const space = await (options.space ?? statfs)(releases, { bigint: true });
+      if (space.bsize <= 0n || space.bavail < 0n || space.files <= 0n || space.ffree < BigInt(manifest.files.length + 4224) || space.bsize * space.bavail < required)
+        throw Error('Insufficient image materialization capacity');
+    } }, copy);
+}
+
+async function stageVerifiedBundle(manifest, identity, releases, options, copy) {
   const destination = join(releases, identity.replace(':', '-'));
   await mkdir(releases, { recursive: true, mode: 0o700 });
   const existing = await stat(destination).catch(error => { if (error.code === 'ENOENT') return null; throw error; });
@@ -250,17 +309,21 @@ export async function stageBundle(manifestFile, blobs, releases, options) {
     // Reusing a preparation interrupted after publication requires both fresh
     // publisher verification above and a full rehash of that exact inventory.
     await verifyInstalledBundle(destination, identity, manifest.baseImage);
+    const dir = await open(releases, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+    try { await dir.sync(); } finally { await dir.close(); }
     return { identity, path: destination };
   }
+  await options?.beforeStage?.(destination);
   const temporary = `${destination}.staging-${randomUUID()}`;
   await mkdir(temporary, { mode: 0o700 });
   try {
     for (const entry of manifest.files) {
+      await options?.checkEntry?.(entry);
       const target = join(temporary, entry.path);
       if (entry.type === 'directory') await mkdir(target, { recursive: true, mode: 0o700 });
       else if (entry.type === 'file') {
         await mkdir(dirname(target), { recursive: true, mode: 0o700 });
-        await copyFile(join(blobs, entry.sha256), target, constants.COPYFILE_EXCL);
+        await copy(entry, target);
         const actual = await hashFile(target);
         if (actual.size !== entry.size || actual.sha256 !== entry.sha256) throw Error('Release blob mismatch');
         await chmod(target, entry.mode & ~0o222);
@@ -287,7 +350,7 @@ export async function stageBundle(manifestFile, blobs, releases, options) {
     const dir = await open(releases, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
     try { await dir.sync(); } finally { await dir.close(); }
     return { identity, path: destination };
-  } catch (error) { await rm(temporary, { recursive: true, force: true }); throw error; }
+  } catch (error) { if (!options?.preserveTemporary) await rm(temporary, { recursive: true, force: true }); throw error; }
 }
 
 // Content addressing does not protect against the owning UID changing permissions.

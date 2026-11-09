@@ -16,10 +16,11 @@ function validJournal(j) {
       (j.receipt.status === 'committed' && j.receipt.to === j.current && j.desired === null ||
         j.receipt.status === 'pending' && j.receipt.from === j.current && j.receipt.to === j.desired));
 }
+const initialPreparation = receipt => receipt.protocol === 1 && receipt.phase === 'prepared' || receipt.protocol === 2 && receipt.mode === 'target-image' && receipt.phase === 'metadata-prepared';
 function matchingInitialMigration(j, receipt) {
   if (!receipt) return !j.initialMigration;
   if (j.initialMigration !== receipt.id || !/^[a-f0-9-]{36}$/.test(j.initialJournalGeneration ?? '') ||
-      receipt.phase !== 'prepared' && j.initialJournalGeneration !== receipt.journalGeneration) return false;
+      !initialPreparation(receipt) && j.initialJournalGeneration !== receipt.journalGeneration) return false;
   return receipt.phase !== 'completed' || j.initialInstall === receipt.id && j.current !== 'bootstrap' &&
     j.recovery === 'persisted-bindings-quarantined' && (j.receipt !== null || j.current === receipt.runtimeIdentity);
 }
@@ -66,7 +67,7 @@ export class RuntimeSupervisor {
       // A receipt records installation history, not permission to invent a new
       // bootstrap journal when the durable history disappears. Only preparation
       // may create the first journal before any migration has run.
-      if (initialMigrationReceipt && initialMigrationReceipt.phase !== 'prepared') {
+      if (initialMigrationReceipt && !initialPreparation(initialMigrationReceipt)) {
         this.journal = { protocol: 0, phase: 'unavailable', revision: 0 };
         return { recoveryRequired: true };
       }

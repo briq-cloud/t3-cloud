@@ -55,7 +55,8 @@ jobs:
           node bin/resolve-gh-release.mjs openai/codex rust-v codex-package-x86_64-unknown-linux-musl.tar.gz "$codex_version" > /tmp/codex-release
           read -r codex codex_sha256 < /tmp/codex-release
           rm /tmp/codex-release
-          base="ghcr.io/briq-cloud/sandbox@$(docker buildx imagetools inspect ghcr.io/briq-cloud/sandbox:latest --format '{{json .Manifest}}' | jq -r .digest)"
+          base="$(awk '/^ARG BASE=/{ if (++n > 1) exit 1; sub(/^ARG BASE=/, ""); print } END { if (n != 1) exit 1 }' Dockerfile)"
+          [[ "$base" =~ ^ghcr\.io/briq-cloud/sandbox@sha256:[0-9a-f]{64}$ ]]
           tag="$(date -u +%Y-%m-%d)"
           if [ "${{ github.event_name }}" != pull_request ]; then
             n=1

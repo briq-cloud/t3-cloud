@@ -79,6 +79,7 @@ jobs:
           provenance: false
           build-args: |
             BASE=${{ steps.version.outputs.base }}
+            SOURCE_COMMIT=${{ github.sha }}
             CLAUDE_VERSION=${{ steps.version.outputs.claude }}
             CODEX_VERSION=${{ steps.version.outputs.codex }}
             CODEX_SHA256=${{ steps.version.outputs.codex_sha256 }}

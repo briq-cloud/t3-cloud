@@ -30,7 +30,7 @@ test('executing native home has the packaged skill without global raw MCP creden
   assert.equal((await stat(join(f.home, 'environments.toml'))).mode & 0o777, 0o600);
   assert.equal(await readFile(join(f.home, 'environments.toml'), 'utf8'), 'default = "none"\ninclude_local = false\n');
   const skill = join(f.home, '.agents/skills/briq');
-  assert.match(await readlink(skill), /t3-cloud\/skills\/briq$/);
+  assert.match(await readlink(skill), /skills\/briq$/);
   assert.match(await readFile(join(skill, 'SKILL.md'), 'utf8'), /name: briq/);
 });
 

@@ -1,0 +1,8 @@
+.git
+node_modules
+briq-cli/node_modules
+*.test.mjs
+*.md
+!t3-source/README.md
+!t3-source/LICENSE
+!skills/**

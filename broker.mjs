@@ -8,9 +8,9 @@ import { withoutExecutingMcpEnvironment } from './briq-native.mjs';
 import { scopedBriqTools } from './scoped-briq.mjs';
 
 const VERSION = 'codex-cli 0.166.0';
-export async function startAppServer({ binary = 'codex', home, path = '/usr/local/bin:/usr/bin:/bin', briqCapability, briqEndpoint },
+export async function startAppServer({ binary = 'codex', home, path = '/usr/local/bin:/usr/bin:/bin', briqCapability, briqEndpoint, previousSkillSource },
   { checkVersion = spawnSync, spawnProcess = spawn } = {}) {
-  const briq = await prepareExecutingCodex({ home, capability: briqCapability, endpoint: briqEndpoint });
+  const briq = await prepareExecutingCodex({ home, capability: briqCapability, endpoint: briqEndpoint, previousSkillSource });
   const env = { HOME: home, CODEX_HOME: home, PATH: path, LANG: 'C.UTF-8', TMPDIR: '/tmp', ...briq.env };
   const version = checkVersion(binary, ['--version'], { env: withoutExecutingMcpEnvironment(env), encoding: 'utf8', timeout: 15000 });
   if (version.status !== 0 || version.stdout.trim() !== VERSION) throw Error('Codex 0.166.0 required');

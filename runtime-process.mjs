@@ -5,6 +5,7 @@ import { join } from 'node:path';
 export function runtimeProcess(env, { spawnProcess = spawn } = {}) {
   let child, sequence = 0, exited = true, updates;
   let updateRequests = 0;
+  let startupFailure = null;
   const pending = new Map();
   function request(method) {
     if (!child || exited) return Promise.reject(Error('Owned manager unavailable'));
@@ -27,10 +28,15 @@ export function runtimeProcess(env, { spawnProcess = spawn } = {}) {
       selected.PATH = `${shims}:/usr/bin:/bin`;
       selected.BROWSER = join(root, 'usr/local/bin/show-url');
       exited = false;
+      startupFailure = null;
       child = spawnProcess(join(root, 'opt/t3/node'), [join(root, 'opt/t3-cloud/manager-main.mjs')],
         { cwd: env.T3_CWD, env: selected, stdio: ['ignore', 'ignore', 'ignore', 'ipc'] });
       child.on('message', value => {
         if (value?.protocol !== 1) return;
+        if (value.channel === 'runtime-startup') {
+          if (Object.keys(value).length === 3 && ['preparing', 'configuration', 'central-runtime', 'management', 'listening', 'restoring', 'native'].includes(value.stage)) startupFailure = value.stage;
+          return;
+        }
         if (value.channel === 'runtime-updates') {
           const current = child;
           const respond = payload => {
@@ -51,6 +57,7 @@ export function runtimeProcess(env, { spawnProcess = spawn } = {}) {
         if (value.channel !== undefined) return;
         const entry = pending.get(value.id); if (!entry) return;
         pending.delete(value.id); clearTimeout(entry.timer);
+        if (!value.ok && ['preparing', 'configuration', 'central-runtime', 'management', 'listening', 'restoring', 'native'].includes(value.startupStage)) startupFailure = value.startupStage;
         if (value.ok) entry.resolve(value.result); else entry.reject(Error('Manager operation unavailable'));
       });
       child.once('exit', () => { exited = true; for (const entry of pending.values()) { clearTimeout(entry.timer); entry.reject(Error('Owned manager exited')); } pending.clear(); });
@@ -73,6 +80,7 @@ export function runtimeProcess(env, { spawnProcess = spawn } = {}) {
       });
     },
     get alive() { return Boolean(child && !exited); },
+    get startupFailure() { return startupFailure; },
   };
 }
 

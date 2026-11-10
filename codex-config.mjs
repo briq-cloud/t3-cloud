@@ -35,7 +35,7 @@ async function replace(file, content) {
 
 // Caller holds central.lock throughout configuration and the native process lifetime.
 // Only the exact legacy baseline and this version's exact generated configs migrate.
-export async function prepareExecutingCodex({ home, capability = {}, endpoint }) {
+export async function prepareExecutingCodex({ home, capability = {}, endpoint, previousSkillSource }) {
   // Retire exact older managed direct-MCP configs without forwarding their grant.
   const desired = config();
   await mkdir(home, { recursive: true, mode: 0o700 });
@@ -45,7 +45,7 @@ export async function prepareExecutingCodex({ home, capability = {}, endpoint })
   const [current, currentEnvironments] = await Promise.all([existingFile(file), existingFile(environments)]);
   if ((current !== undefined && !knownConfig(current)) || (currentEnvironments !== undefined && currentEnvironments !== ENVIRONMENTS))
     throw Error('Managed Codex configuration changed');
-  installBriqSkill(join(home, '.agents/skills'), { managed: true });
+  installBriqSkill(join(home, '.agents/skills'), { managed: true, previousSource: previousSkillSource });
   if (current !== desired) await replace(file, desired);
   if (currentEnvironments === undefined) await replace(environments, ENVIRONMENTS);
   return { env: {}, status: 'allocation-scoped' };

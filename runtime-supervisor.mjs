@@ -1,6 +1,6 @@
 import { randomUUID, createHash } from 'node:crypto';
 import { constants } from 'node:fs';
-import { mkdir, open, readFile, rename } from 'node:fs/promises';
+import { mkdir, open, readFile, rename, lstat } from 'node:fs/promises';
 import { isAbsolute, join } from 'node:path';
 import { stageBundle, verifyInstalledBundle } from './runtime-bundle.mjs';
 
@@ -23,6 +23,69 @@ function matchingInitialMigration(j, receipt) {
       !initialPreparation(receipt) && j.initialJournalGeneration !== receipt.journalGeneration) return false;
   return receipt.phase !== 'completed' || j.initialInstall === receipt.id && j.current !== 'bootstrap' &&
     j.recovery === 'persisted-bindings-quarantined' && (j.receipt !== null || j.current === receipt.runtimeIdentity);
+}
+
+// Called by the selected manager while it owns central state. Older bootstrap
+// loaders already persist this activation evidence; no new startup IPC is needed.
+async function verifySkillPredecessor(root, identity, baseImage) {
+  // The durable receipt pins the manifest accepted by the original verifier.
+  // No previous executable or skill bytes are executed by this migration.
+  for (const path of [join(root, '..'), root, join(root, 'opt'), join(root, 'opt/t3-cloud'), join(root, 'opt/t3-cloud/skills'), join(root, 'opt/t3-cloud/skills/briq')]) {
+    const info = await lstat(path);
+    if (!info.isDirectory() || info.uid !== process.getuid() || info.mode & 0o022) throw Error('Unsafe skill predecessor directory');
+  }
+  const handle = await open(join(root, '.release-manifest.json'), constants.O_RDONLY | constants.O_NOFOLLOW);
+  try {
+    const info = await handle.stat();
+    if (!info.isFile() || info.nlink !== 1 || info.uid !== process.getuid() || info.mode & 0o022 || info.size > 16_000_000)
+      throw Error('Unsafe skill predecessor manifest');
+    const bytes = Buffer.alloc(info.size + 1); let size = 0;
+    while (size < bytes.length) {
+      const { bytesRead } = await handle.read(bytes, size, bytes.length - size, null);
+      if (!bytesRead) break; size += bytesRead;
+    }
+    if (size !== info.size) throw Error('Skill predecessor manifest changed');
+    const manifest = JSON.parse(bytes.subarray(0, size));
+    if (`sha256:${createHash('sha256').update(JSON.stringify(manifest)).digest('hex')}` !== identity || manifest.baseImage !== baseImage ||
+        !manifest.files.some(entry => entry.path === 'opt/t3-cloud/skills/briq' && entry.type === 'directory') ||
+        !manifest.files.some(entry => entry.path === 'opt/t3-cloud/skills/briq/SKILL.md' && entry.type === 'file'))
+      throw Error('Skill predecessor identity mismatch');
+  } finally { await handle.close(); }
+}
+export async function managedSkillPredecessor({ state, selected, baseImage, environmentBinding }, {
+  verify = verifySkillPredecessor,
+  readMigration = async () => (await import('./runtime-bootstrap-migration.mjs')).readBootstrapMigration(state),
+} = {}) {
+  if (!isAbsolute(state) || !identity(selected) || !identity(baseImage)) throw Error('Managed skill predecessor unavailable');
+  const handle = await open(join(state, 'updates/activation.json'), constants.O_RDONLY | constants.O_NOFOLLOW);
+  let journal;
+  try {
+    const info = await handle.stat();
+    if (!info.isFile() || info.nlink !== 1 || info.uid !== process.getuid() || info.mode & 0o077 || info.size > 65536)
+      throw Error('Managed skill predecessor unavailable');
+    const bytes = Buffer.alloc(info.size + 1); let size = 0;
+    while (size < bytes.length) {
+      const { bytesRead } = await handle.read(bytes, size, bytes.length - size, null);
+      if (!bytesRead) break; size += bytesRead;
+    }
+    if (size !== info.size) throw Error('Managed skill predecessor changed');
+    journal = JSON.parse(bytes.subarray(0, size));
+  } finally { await handle.close(); }
+  if (!validJournal(journal) || !['starting', 'running'].includes(journal.phase) ||
+      !(journal.desired === selected && journal.receipt?.status === 'pending' || journal.current === selected && journal.desired === null))
+    throw Error('Managed skill predecessor unavailable');
+  let previous;
+  if (journal.receipt?.to === selected && journal.receipt.from !== selected) previous = journal.receipt.from;
+  else if (journal.receipt === null) {
+    const migration = await readMigration();
+    if (migration && ['recovering', 'completed'].includes(migration.phase) && migration.environmentBinding === environmentBinding &&
+        migration.runtimeIdentity === selected && migration.baseImage === baseImage && journal.initialInstall === migration.id &&
+        journal.recovery === 'persisted-bindings-quarantined' && matchingInitialMigration(journal, migration)) previous = 'bootstrap';
+  }
+  if (previous === undefined) return undefined;
+  const root = previous === 'bootstrap' ? '/' : join(state, 'releases', previous.replace(':', '-'));
+  if (previous !== 'bootstrap') await verify(root, previous, baseImage);
+  return join(root, 'opt/t3-cloud/skills/briq');
 }
 export async function durableJson(path, value) {
   const temporary = `${path}.${randomUUID()}`;

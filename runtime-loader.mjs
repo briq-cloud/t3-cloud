@@ -62,6 +62,23 @@ export async function startLoader(env = process.env, {
   const supervisor = createSupervisor({ state, baseImage, driver });
   let updates, recoveryServer, closing, controllerIdentity, controllerRecovery, controllerFault = false, bootstrapSource = null, transition, updateScheduled = false;
   let recoveryOperation = null;
+  let recoveryStarting;
+  const exposeRecovery = () => {
+    if (closing || recoveryServer?.listening) return Promise.resolve();
+    if (recoveryStarting) return recoveryStarting;
+    supervisor.admitting = false; for (const listener of listeners) listener.fence();
+    recoveryStarting = (async () => {
+      // Failed live activation receives the same management-only surface as
+      // interrupted startup. This never starts, retries or adopts a manager.
+      const server = await createRecoveryManager({ role: env.T3_CLOUD_ROLE ?? 'central', publicOrigin: env.T3_CLOUD_PUBLIC_ORIGIN,
+        ownerKey: env.T3_CLOUD_OWNER_KEY, ownerId: env.T3_CLOUD_OWNER_ID, managementOnly: true,
+        runtimeUpdates: { status: () => operations('status'), check: () => operations('check'),
+          update: () => operations('update'), automatic: enabled => operations('automatic', enabled), reconcile: input => operations('reconcile', input) } });
+      await new Promise((resolve, reject) => { server.once('error', reject); server.listen(8084, '127.0.0.1', resolve); });
+      recoveryServer = server;
+    })().finally(() => { recoveryStarting = null; });
+    return recoveryStarting;
+  };
   const fenceAdmission = () => { controllerFault = true; supervisor.admitting = false; for (const listener of listeners) listener.fence(); };
   const createController = async recovery => {
     const current = supervisor.journal.current;
@@ -71,7 +88,7 @@ export async function startLoader(env = process.env, {
     const controller = await createUpdates({ root: recovery ? '/' : supervisor.releaseRoot(current), state, currentSource, recovery, env,
       status: async () => supervisor.journal, activity: () => driver.activity(),
       stage: (file, blobs) => supervisor.stageRelease(file, blobs), activate: () => supervisor.activate(),
-      completeDrain: () => supervisor.completeDrain(), onTerminal: () => replaceController(false),
+      completeDrain: () => supervisor.completeDrain(), onTerminal: () => supervisor.journal.phase === 'recovery-required' ? exposeRecovery() : replaceController(false),
       onFailure: fenceAdmission });
     try { await controller.initialize(); } catch (error) { try { await controller.stop(); } catch {} throw error; }
     controllerIdentity = current; controllerRecovery = recovery;
@@ -104,7 +121,7 @@ export async function startLoader(env = process.env, {
     }
     if (method === 'status') {
       const status = await updates.status();
-      return { ...status, busy: Boolean(status.busy || supervisor.busy || recoveryOperation?.outcome === 'in-progress'), recovery: { ownership: ownership.evidence, ownershipRevision: ownership.revision, journalRevision: supervisor.journal.revision ?? 0, bindingsQuarantined: Boolean(supervisor.journal.recovery), required: Boolean(recoveryServer), available: !['in-progress', 'unresolved'].includes(recoveryOperation?.outcome) && (migrationPending ? migration.phase !== 'invalid' : supervisor.recoverable()), ...(migrationPending && recoveryServer ? { migration: { id: migration.id, revision: migration.revision } } : {}), ...(recoveryOperation ? { operation: { ...recoveryOperation, processLocal: true } } : {}) } };
+      return { ...status, ...(driver.startupFailure ? { startupFailure: { stage: driver.startupFailure } } : {}), busy: Boolean(status.busy || supervisor.busy || recoveryOperation?.outcome === 'in-progress'), recovery: { ownership: ownership.evidence, ownershipRevision: ownership.revision, journalRevision: supervisor.journal.revision ?? 0, bindingsQuarantined: Boolean(supervisor.journal.recovery), required: Boolean(recoveryServer), available: !['in-progress', 'unresolved'].includes(recoveryOperation?.outcome) && (migrationPending ? migration.phase !== 'invalid' : supervisor.recoverable()), ...(migrationPending && recoveryServer ? { migration: { id: migration.id, revision: migration.revision } } : {}), ...(recoveryOperation ? { operation: { ...recoveryOperation, processLocal: true } } : {}) } };
     }
     if (method === 'reconcile') {
       if (!recoveryServer || closing) throw Error('Recovery management unavailable');
@@ -159,11 +176,7 @@ export async function startLoader(env = process.env, {
     if (status.recoveryRequired) {
       // Quarantine never starts the central runtime, credentials, native service
       // or terminal. Only the image's owner-authenticated update surface runs.
-      recoveryServer = await createRecoveryManager({ role: env.T3_CLOUD_ROLE ?? 'central', publicOrigin: env.T3_CLOUD_PUBLIC_ORIGIN,
-        ownerKey: env.T3_CLOUD_OWNER_KEY, ownerId: env.T3_CLOUD_OWNER_ID, managementOnly: true,
-        runtimeUpdates: { status: () => operations('status'), check: () => operations('check'),
-          update: () => operations('update'), automatic: enabled => operations('automatic', enabled), reconcile: input => operations('reconcile', input) } });
-      await new Promise((resolve, reject) => { recoveryServer.once('error', reject); recoveryServer.listen(8084, '127.0.0.1', resolve); });
+      await exposeRecovery();
     } else await updates.start();
     return { supervisor, get updates() { return updates; }, status, close() {
       if (closing) return closing;
@@ -174,6 +187,7 @@ export async function startLoader(env = process.env, {
         let stopped = false;
         try {
           await transition;
+          await recoveryStarting;
           await updates.stop();
           stopped = true;
           await supervisor.shutdown();

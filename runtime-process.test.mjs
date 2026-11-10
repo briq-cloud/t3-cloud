@@ -1,10 +1,82 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, rm, writeFile, mkdir, cp, realpath, symlink, readlink } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { runtimeProcess } from './runtime-process.mjs';
+import { runtimeProcess as originalRuntimeProcess } from './fixtures/runtime-process-v1.mjs';
+import { createHash } from 'node:crypto';
+
+test('real manager startup failure reports a fixed stage and exits instead of retaining its IPC queue', async t => {
+  const directory = await mkdtemp(join(tmpdir(), 't3-failed-manager-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  let exited;
+  const driver = runtimeProcess({ T3_CWD: directory }, {
+    spawnProcess: (_command, _args, options) => {
+      const child = spawn(process.execPath, [new URL('./manager-main.mjs', import.meta.url).pathname], options);
+      exited = new Promise(resolve => child.once('exit', resolve)); return child;
+    },
+  });
+  t.after(() => driver.stop());
+  await assert.rejects(driver.start('/'), /Manager operation unavailable|Owned manager exited/);
+  await exited;
+  assert.equal(driver.alive, false); assert.equal(driver.startupFailure, 'preparing');
+});
+
+test('original bootstrap process protocol starts relocated manager configuration without new environment authority', async t => {
+  const state = await realpath(await mkdtemp(join(tmpdir(), 't3-original-process-')));
+  t.after(() => rm(state, { recursive: true, force: true }));
+  const baseImage = `sha256:${'b'.repeat(64)}`;
+  // Unrelated archive-sized payload is deliberately absent: predecessor
+  // authorization must not read or hash old executables inside the 40s IPC gate.
+  const priorManifest = { baseImage, files: [
+    { path: 'opt/t3-cloud/skills/briq', type: 'directory', mode: 0o700 },
+    { path: 'opt/t3-cloud/skills/briq/SKILL.md', type: 'file', size: 1, mode: 0o600, sha256: '0'.repeat(64) },
+    { path: 'opt/old-native', type: 'file', size: 1_400_000_000, mode: 0o700, sha256: '0'.repeat(64) },
+  ] };
+  const selected = `sha256:${createHash('sha256').update(JSON.stringify(priorManifest)).digest('hex')}`;
+  const root = join(state, 'releases', selected.replace(':', '-'));
+  const app = join(root, 'opt/t3-cloud'), home = join(state, 'codex');
+  await mkdir(app, { recursive: true }); await mkdir(join(state, 'updates'));
+  for (const path of ['codex-config.mjs', 'briq-native.mjs', 'skills']) await cp(new URL(path, import.meta.url), join(app, path), { recursive: true });
+  await writeFile(join(root, '.release-manifest.json'), JSON.stringify(priorManifest), { mode: 0o400 });
+  await mkdir(join(home, '.agents/skills'), { recursive: true });
+  await symlink('/opt/t3-cloud/skills/briq', join(home, '.agents/skills/briq'));
+  await writeFile(join(state, 'updates/activation.json'), JSON.stringify({ protocol: 1, current: 'bootstrap', desired: selected,
+    staged: selected, phase: 'starting', receipt: { from: 'bootstrap', to: selected, status: 'pending' } }), { mode: 0o600 });
+  const entry = join(app, 'manager-fixture.mjs');
+  await writeFile(entry, `import { managedSkillPredecessor } from ${JSON.stringify(new URL('./runtime-supervisor.mjs', import.meta.url).href)};
+    import { prepareExecutingCodex } from './codex-config.mjs';
+    if (process.env.T3_CLOUD_PREVIOUS_SKILL_SOURCE !== undefined) throw Error('unexpected new authority');
+    const selected = 'sha256:' + process.env.T3_RELEASE_ROOT.slice(-64);
+    const previousSkillSource = await managedSkillPredecessor({state: process.env.T3_CLOUD_STATE, selected, baseImage: '${baseImage}'});
+    await prepareExecutingCodex({home: ${JSON.stringify(home)}, previousSkillSource});
+    process.on('message', value => process.send({protocol: 1, id: value.id, ok: true, result: {ready: true}}));
+    process.once('disconnect', () => process.exit(0));`);
+  const driver = originalRuntimeProcess({ T3_CWD: state, T3_CLOUD_STATE: state }, {
+    spawnProcess: (_command, _args, options) => spawn(process.execPath, [entry], options),
+  });
+  t.after(() => driver.stop());
+  await driver.start(root, { childImage: `image@sha256:${'c'.repeat(64)}` });
+  assert.deepEqual(await driver.health(), { ready: true });
+  assert.equal(await readlink(join(home, '.agents/skills/briq')), join(app, 'skills/briq'));
+  await driver.stop(); assert.equal(driver.alive, false);
+  const second = `sha256:${'d'.repeat(64)}`, secondRoot = join(state, 'releases', second.replace(':', '-'));
+  await mkdir(join(secondRoot, 'opt'), { recursive: true });
+  await cp(app, join(secondRoot, 'opt/t3-cloud'), { recursive: true });
+  await writeFile(join(state, 'updates/activation.json'), JSON.stringify({ protocol: 1, current: selected, desired: second,
+    staged: second, phase: 'starting', receipt: { from: selected, to: second, status: 'pending' } }), { mode: 0o600 });
+  const secondEntry = join(secondRoot, 'opt/t3-cloud/manager-fixture.mjs');
+  const nextDriver = originalRuntimeProcess({ T3_CWD: state, T3_CLOUD_STATE: state }, {
+    spawnProcess: (_command, _args, options) => spawn(process.execPath, [secondEntry], options),
+  });
+  t.after(() => nextDriver.stop());
+  await nextDriver.start(secondRoot, { childImage: `image@sha256:${'e'.repeat(64)}` });
+  assert.deepEqual(await nextDriver.health(), { ready: true });
+  assert.equal(await readlink(join(home, '.agents/skills/briq')), join(secondRoot, 'opt/t3-cloud/skills/briq'));
+  await nextDriver.stop(); assert.equal(nextDriver.alive, false);
+});
 
 test('owned process uses selected Node, dependencies and child image, then acknowledges descendant shutdown', async t => {
   const directory = await mkdtemp(join(tmpdir(), 't3-owned-process-')); t.after(() => rm(directory, { recursive: true, force: true }));

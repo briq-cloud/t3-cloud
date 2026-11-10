@@ -26,7 +26,7 @@ async function unusedPort() {
   const server = createServer(); server.listen(0, '127.0.0.1'); await once(server, 'listening');
   const port = server.address().port; await new Promise(resolve => server.close(resolve)); return port;
 }
-async function fixture(t, { recovery = false, unknown = false, journal, ownershipEvidence, bootstrapMigration = false, releaseController = false, expectedCloseFailure = false, recoveryMaterialize, controllerInitialize } = {}) {
+async function fixture(t, { recovery = false, unknown = false, journal, ownershipEvidence, bootstrapMigration = false, releaseController = false, expectedCloseFailure = false, recoveryMaterialize, controllerInitialize, failRelease = false } = {}) {
   const state = await mkdtemp(join(tmpdir(), 't3-loader-integration-'));
   let loader;
   t.after(async () => {
@@ -133,7 +133,8 @@ async function fixture(t, { recovery = false, unknown = false, journal, ownershi
     baseImageFile, sourceFile, acquireOwnership: bootstrapMigration ? migratedOwnership : ownershipEvidence ? options => acquireRuntimeOwnership({ ...options, lock: testLock, identity: async () => ({ ...testIdentity, ...(ownershipEvidence === 'cold' ? { bootId: '22222222-2222-2222-2222-222222222222' } : {}) }) }) : testOwnership,
     recoverMigration: options => recoverBootstrapMigration({ ...options, identity: async () => ({ ...testIdentity, bootId: '22222222-2222-2222-2222-222222222222' }), acquireOwnership: migratedOwnership, ...(materialize ? { materialize: recoveryMaterialize ? (...args) => recoveryMaterialize(() => materialize(...args)) : materialize } : {}) }),
     createDriver: env => runtimeProcess(env, { spawnProcess: (_command, _args, options) => {
-      starts++; recoveries.push(options.env.T3_CLOUD_RECOVERY); return spawn(process.execPath, [childFile], options);
+      starts++; recoveries.push(options.env.T3_CLOUD_RECOVERY);
+      return spawn(process.execPath, failRelease && starts > 1 ? ['-e', 'process.exit(1)'] : [childFile], options);
     } }),
     createSupervisor: options => new RuntimeSupervisor({ ...options, verify: bootstrapMigration === 'metadata' ? verifyInstalledBundle : async () => manifest, stage: async () => ({ identity }) }),
     createUpdates: options => {
@@ -214,6 +215,23 @@ test('authenticated owner update crosses real IPC; drain status stays available 
     { from: 'bootstrap', to: identity, status: 'committed' });
   // Cookie belongs to the old manager generation and cannot authorize the new one.
   assert.equal((await f.send('/_cloud/updates/status', { auth: false, cookie })).status, 401);
+});
+
+test('failed live activation exposes management without replaying the failed manager or rolling back', async t => {
+  const f = await fixture(t, { releaseController: true, failRelease: true });
+  await f.loader.updates.check(); await f.loader.updates.update();
+  // The first attempt waits for the normal active-request drain.
+  await f.loader.updates.tick(); await f.waitController();
+  const health = await f.send('/_cloud/health', { auth: false });
+  assert.equal(health.status, 200); assert.deepEqual(health.value, { surface: 'management', status: 'ok' });
+  assert.equal((await f.send('/_cloud/updates/status', { auth: false })).status, 401);
+  const status = (await f.send('/_cloud/updates/status')).value;
+  assert.equal(status.phase, 'recovery-required'); assert.equal(status.current, 'bootstrap');
+  assert.equal(status.desired, identity); assert.equal(status.receipt.status, 'pending');
+  assert.equal(status.recovery.required, true); assert.equal(status.recovery.available, false);
+  assert.equal((await f.send('/.well-known/t3/environment', { auth: false })).status, 503);
+  const starts = f.starts(); await f.loader.updates.tick();
+  assert.equal(f.starts(), starts); assert.equal(starts, 2);
 });
 
 test('ambiguous restart exposes only owner-authenticated recovery UI without starting native or central runtime', async t => {

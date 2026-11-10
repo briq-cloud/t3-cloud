@@ -1,8 +1,9 @@
 import { acquireRuntimeOwnership } from './runtime-ownership.mjs';
 import { ClaudeRuntime } from './claude-runtime.mjs';
 import { edgeToken, edgeAuthorized, requireEdgeBinding } from './edge-auth.mjs';
-import { mkdir } from 'node:fs/promises';
+import { mkdir, readFile } from 'node:fs/promises';
 import { join, isAbsolute } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { WebSocketServer, WebSocket } from 'ws';
 import { AllocationStore, ThreadAllocator, identifier, threadIdentifier, providerInstanceId } from './allocations.mjs';
 import { BriqCloud } from './briq-cloud.mjs';
@@ -10,6 +11,7 @@ import { startAppServer, CapabilityBroker } from './broker.mjs';
 import { runtimePath, runtimePathEnv } from './runtime-paths.mjs';
 import { ScopedBriq } from './scoped-briq.mjs';
 import { ScopedMcpTransport } from './scoped-mcp-transport.mjs';
+import { managedSkillPredecessor } from './runtime-supervisor.mjs';
 
 // Owner management for existing children only; never calls allocation or recovery.
 export function childPairing({ store, cloud, edgeCredential, admittedProviders, ready }) {
@@ -60,6 +62,8 @@ export function childPairing({ store, cloud, edgeCredential, admittedProviders, 
 // A single refresh owner. A stale lock needs explicit operator reconciliation;
 // an uncertain process lifetime never licenses a second app-server.
 export async function createCentralRuntime(env = process.env, dependencies = {}) {
+  if (env.T3_RELEASE_ROOT && runtimePath(env, 'opt/t3-cloud/central-runtime.mjs') !== fileURLToPath(import.meta.url))
+    throw Error('Selected manager root mismatch');
   const edgeCredential = edgeToken(env.T3_CLOUD_EDGE_TOKEN);
   const directory = env.T3_CLOUD_STATE;
   if (!directory || !isAbsolute(directory)) throw Error('Absolute central state directory required');
@@ -88,9 +92,18 @@ export async function createCentralRuntime(env = process.env, dependencies = {})
   try {
     const store = new AllocationStore(join(directory, 'allocations')); await store.initialize();
     for (const binding of [...await store.list(), ...await store.listSources()]) if (binding.state !== 'revoked') requireEdgeBinding(binding, edgeCredential);
+    let previousSkillSource;
+    if (env.T3_RELEASE_ROOT) {
+      // runtimePath validates the selected root against this central state.
+      runtimePath(env, 'opt/t3-cloud/skills/briq');
+      const selected = `sha256:${env.T3_RELEASE_ROOT.slice(-64)}`;
+      const baseImage = (await readFile('/etc/t3-cloud/base-image', 'utf8')).trim();
+      previousSkillSource = await managedSkillPredecessor({ state: directory, selected, baseImage, environmentBinding: env.T3_CLOUD_OWNER_ID });
+    }
     app = await (dependencies.startAppServer ?? startAppServer)({ binary: env.T3_CLOUD_CODEX_BINARY ??
       (env.T3_RELEASE_ROOT ? runtimePath(env, 'opt/codex/bin/codex') : 'codex'),
-      home: join(directory, 'codex'), ...(env.T3_RELEASE_ROOT ? { path: runtimePathEnv(env) } : {}) });
+      home: join(directory, 'codex'), ...(previousSkillSource ? { previousSkillSource } : {}),
+      ...(env.T3_RELEASE_ROOT ? { path: runtimePathEnv(env) } : {}) });
     const cloud = dependencies.cloud ?? new BriqCloud({ directory: join(directory, 'stacks'), env });
     const scopedBriq = new ScopedBriq({ store, cloud });
     briqTransport = (dependencies.createScopedMcpTransport ?? (options => new ScopedMcpTransport(options)))({ store, scopedBriq, endpoint: `http://127.0.0.1:${env.PORT ?? 8080}/_cloud/briq/mcp` });

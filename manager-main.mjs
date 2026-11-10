@@ -11,7 +11,8 @@ import { runtimeUpdateClient } from './runtime-process.mjs';
 import { runtimePath, runtimePathEnv } from './runtime-paths.mjs';
 
 // Management and native admission have separate listeners; native processes stay loopback.
-export async function startManager(env = process.env, { centralRuntime, spawnProcess = spawn, updates } = {}) {
+export async function startManager(env = process.env, { centralRuntime, spawnProcess = spawn, updates, onStage = () => {} } = {}) {
+  onStage('configuration');
   const role = env.T3_CLOUD_ROLE ?? 'central';
   if (!['central', 'standalone'].includes(role)) throw Error('Manager role must be central or standalone');
   const origin = publicOrigin(env.T3_CLOUD_PUBLIC_ORIGIN);
@@ -46,9 +47,11 @@ export async function startManager(env = process.env, { centralRuntime, spawnPro
   }
   try {
     if (role === 'central') {
+      onStage('central-runtime');
       const factory = centralRuntime ?? (await import('./central-runtime.mjs')).createCentralRuntime;
       runtime = await factory(env);
     }
+    onStage('management');
     connections = nativeConnections(env, { claudeCredentialOwner: runtime?.claudeCredentialOwner, briqCredentialOwner: runtime?.briqCredentialOwner });
     server = createCloudManager({ role, publicOrigin: origin, ownerKey: env.T3_CLOUD_OWNER_KEY,
       ownerId: env.T3_CLOUD_OWNER_ID, nativeOrigin: phoneOrigin,
@@ -73,8 +76,11 @@ export async function startManager(env = process.env, { centralRuntime, spawnPro
     child.once('error',()=>{process.exitCode=1;void close();});
     child.once('exit',()=>{if(!stopping){process.exitCode=1;void close();}});
   }
+    onStage('listening');
     await new Promise((resolve,reject)=>{server.once('error',reject);server.listen(port,env.T3_HOST ?? '0.0.0.0',resolve);});
+    onStage('restoring');
     await runtime?.restore?.();
+    onStage('native');
     launch(runtimePath(env, 'opt/t3/t3'),['serve','--host','127.0.0.1','--port','3773','--base-dir',env.T3_STATE,'--no-browser',env.T3_CWD],nativeEnv);
     const terminalEnv=withoutExecutingMcpEnvironment(withoutEdgeEnvironment(env));delete terminalEnv.T3_CLOUD_OWNER_KEY;delete terminalEnv.T3_CLOUD_ALLOCATOR_TOKEN;
     terminalEnv.PATH = runtimePathEnv(env);
@@ -113,9 +119,10 @@ if (process.argv[1] && import.meta.url === new URL(`file://${process.argv[1]}`).
   const queued = [];
   const queue = value => { if (queued.length < 8) queued.push(value); };
   if (process.send) process.on('message', queue);
+  let stage = 'preparing';
   try {
     if (process.env.T3_CLOUD_SUPERVISED === '1') (await import('./prepare.mjs')).prepare();
-    const manager=await startManager();
+    const manager=await startManager(process.env, { onStage: value => { stage = value; } });
     process.once('SIGTERM',()=>void manager.close());process.once('SIGINT',()=>void manager.close());
     if (process.send && process.env.T3_CLOUD_SUPERVISED === '1') {
       process.off('message', queue);
@@ -130,5 +137,13 @@ if (process.argv[1] && import.meta.url === new URL(`file://${process.argv[1]}`).
       for (const value of queued) void receive(value);
       process.once('disconnect', () => { void manager.close().then(() => process.exit(0), () => process.exit(1)); });
     }
-  } catch { process.stderr.write('T3 Cloud startup failed: verify private runtime configuration\n');process.exitCode=1; }
+  } catch {
+    // Fixed stages only: never forward native output, exception text or config.
+    if (process.connected) process.send?.({ protocol: 1, channel: 'runtime-startup', stage });
+    for (const value of queued) if (process.connected && value?.protocol === 1 && Number.isSafeInteger(value.id) && value.method === 'health')
+      process.send?.({ protocol: 1, id: value.id, ok: false, startupStage: stage });
+    process.off('message', queue);
+    process.stderr.write(`T3 Cloud startup failed at ${stage}\n`); process.exitCode=1;
+    if (process.connected) process.disconnect();
+  }
 }

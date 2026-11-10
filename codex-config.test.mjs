@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, writeFile, stat, readlink, mkdir, symlink, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, writeFile, stat, readlink, mkdir, symlink, rm, cp, realpath } from 'node:fs/promises';
+import { pathToFileURL } from 'node:url';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { EventEmitter } from 'node:events';
@@ -121,6 +122,33 @@ test('existing managed skill collisions are preserved and stop startup', async t
   await assert.rejects(prepareExecutingCodex(f), /Managed Briq skill changed/);
   assert.equal(await readFile(join(skill, 'SKILL.md'), 'utf8'), 'owner skill');
   await assert.rejects(stat(f.file), { code: 'ENOENT' });
+});
+
+test('real relocated modules migrate only the exact authorized predecessor skill', async t => {
+  const f = await fixture(t), roots = [];
+  const base = await realpath(f.home);
+  for (const name of ['bootstrap', 'release-a', 'release-b']) {
+    const root = join(base, name, 'opt/t3-cloud'); roots.push(root);
+    await mkdir(root, { recursive: true });
+    for (const path of ['codex-config.mjs', 'briq-native.mjs', 'skills'])
+      await cp(new URL(path, import.meta.url), join(root, path), { recursive: true });
+  }
+  const home = join(base, 'executing'), skill = join(home, '.agents/skills/briq');
+  const modules = await Promise.all(roots.map(root => import(pathToFileURL(join(root, 'codex-config.mjs')))));
+  await modules[0].prepareExecutingCodex({ home });
+  const configBefore = await readFile(join(home, 'config.toml'), 'utf8');
+  for (let index = 1; index < modules.length; index++) {
+    const previousSkillSource = join(roots[index - 1], 'skills/briq');
+    await assert.rejects(modules[index].prepareExecutingCodex({ home }), /Managed Briq skill changed/);
+    assert.equal(await readlink(skill), previousSkillSource);
+    await modules[index].prepareExecutingCodex({ home, previousSkillSource });
+    assert.equal(await readlink(skill), join(roots[index], 'skills/briq'));
+    assert.equal(await readFile(join(home, 'config.toml'), 'utf8'), configBefore);
+    await modules[index].prepareExecutingCodex({ home, previousSkillSource });
+  }
+  await rm(skill); await symlink(join(base, 'unrelated'), skill);
+  await assert.rejects(modules[2].prepareExecutingCodex({ home, previousSkillSource: join(roots[1], 'skills/briq') }), /Managed Briq skill changed/);
+  assert.equal(await readlink(skill), join(base, 'unrelated'));
 });
 
 test('managed skill root symlinks do not authorize writing into an owner directory', async t => {

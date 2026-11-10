@@ -2,6 +2,16 @@ import { testOwnership } from './fixtures/runtime-ownership.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { startManager } from './manager-main.mjs';
+test('mismatched selected root cannot claim central ownership or mutate managed configuration', async () => {
+ const { createCentralRuntime } = await import('./central-runtime.mjs');
+ let claimed = false, started = false;
+ await assert.rejects(createCentralRuntime({ T3_CLOUD_STATE: '/work/.t3-cloud',
+  T3_RELEASE_ROOT: `/work/.t3-cloud/releases/sha256-${'a'.repeat(64)}` }, {
+  acquireOwnership: async () => { claimed = true; throw Error('must not claim'); },
+  startAppServer: async () => { started = true; throw Error('must not launch'); },
+ }), /Selected manager root mismatch/);
+ assert.equal(claimed, false); assert.equal(started, false);
+});
 test('product startup validates owner configuration before starting any broker or native process',async()=>{
  let started=false;const deps={centralRuntime:async()=>{started=true;throw Error('unexpected runtime');},spawnProcess:()=>{started=true;throw Error('unexpected spawn');}};
  await assert.rejects(startManager({T3_CLOUD_PUBLIC_ORIGIN:'https://cloud.example'},deps),/owner key/);

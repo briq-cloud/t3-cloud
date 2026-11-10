@@ -1,4 +1,5 @@
-import { mkdirSync, lstatSync, readlinkSync, symlinkSync, statSync } from 'node:fs';
+import { mkdirSync, lstatSync, readlinkSync, symlinkSync, statSync, renameSync, unlinkSync, openSync, fsyncSync, closeSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -30,7 +31,7 @@ export function withoutExecutingMcpEnvironment(env = {}) {
   return Object.fromEntries(Object.entries(env).filter(([key]) => key.toUpperCase() !== 'BRIQ_MCP_TOKEN'));
 }
 
-export function installBriqSkill(root, { managed = false } = {}) {
+export function installBriqSkill(root, { managed = false, previousSource } = {}) {
   const source = fileURLToPath(new URL('./skills/briq', import.meta.url));
   if (!statSync(join(source, 'SKILL.md')).isFile()) throw Error('Packaged Briq skill unavailable');
   if (managed) {
@@ -45,6 +46,18 @@ export function installBriqSkill(root, { managed = false } = {}) {
   let existing;
   try { existing = lstatSync(target); } catch (error) { if (error.code !== 'ENOENT') throw error; }
   if (!existing) symlinkSync(source, target, 'dir');
-  else if (managed && (!existing.isSymbolicLink() || readlinkSync(target) !== source))
-    throw Error('Managed Briq skill changed');
+  else if (managed && (!existing.isSymbolicLink() || readlinkSync(target) !== source)) {
+    // Only the supervisor-authorized predecessor may move to this package.
+    // A similar path or identical owner-provided content grants no authority.
+    if (!existing.isSymbolicLink() || typeof previousSource !== 'string' || readlinkSync(target) !== previousSource)
+      throw Error('Managed Briq skill changed');
+    const temporary = join(root, `.briq-${randomUUID()}`);
+    try {
+      symlinkSync(source, temporary, 'dir'); renameSync(temporary, target);
+      const directory = openSync(root, 'r');
+      try { fsyncSync(directory); } finally { closeSync(directory); }
+    } finally {
+      try { unlinkSync(temporary); } catch (error) { if (error.code !== 'ENOENT') throw error; }
+    }
+  }
 }

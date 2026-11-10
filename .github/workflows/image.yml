@@ -130,6 +130,8 @@ jobs:
           # A second bootstrap must preserve the definitions accepted during native startup.
           echo 'smoke: rebootstrap'
           docker exec "$t3_smoke_id" t3-cloud-start true
+          echo 'smoke: managed skill relocation with pinned Codex'
+          docker exec "$t3_smoke_id" node /opt/t3-cloud/bin/check-managed-skill-upgrade.mjs
           echo 'smoke: config'
           docker exec "$t3_smoke_id" node -e 'const fs=require("node:fs"),assert=require("node:assert/strict");assert.match(fs.readFileSync("/work/.logins/codex/config.toml","utf8"),/bearer_token_env_var = "BRIQ_MCP_TOKEN"/);assert.equal(JSON.parse(fs.readFileSync("/work/.logins/claude/.claude.json","utf8")).mcpServers.briq.headers.Authorization,"Bearer \u0024{BRIQ_MCP_TOKEN}");assert.ok(fs.existsSync("/work/.t3/home/.agents/skills/briq/SKILL.md"));assert.ok(fs.existsSync("/work/.logins/claude/skills/briq/SKILL.md"))'
 

@@ -195,7 +195,9 @@ disk growth, start the exact pinned target image once; it remains management-onl
 Explicit recovery checks revisions, the changed boot, signed inventory and legacy
 fingerprints, then copies only application paths from that image into a sealed,
 content-addressed release. Every file, mode and link is checked against the signed
-inventory. The image is a source of candidate bytes, not verification authority.
+inventory. Image-source hardlinks are read into independent single-link files;
+installed release files must remain single-link. The image is a source of
+candidate bytes, not verification authority.
 Installation reserves the full file inventory plus filesystem and application
 headroom using measured free bytes and inodes.
 
@@ -214,6 +216,15 @@ evidence, and the exact prepared runtime. Legacy lock directories are renamed
 into migration evidence, never deleted. The selected release becomes the initial
 installation with no fabricated activation receipt. Existing bindings remain
 quarantined; recovery never replays native work, signs in or pairs a device.
+
+Recovery status reports loader activity through `busy` and a bounded
+`recovery.operation` outcome and stage. This observation is process-local;
+its absence after restart does not prove that an earlier request had no effects.
+Materialization can outlast an HTTP request while the receipt still says
+`metadata-prepared`. A client timeout does not cancel recovery. Inspect status
+without resending the mutation. An `unresolved` outcome disables recovery and
+refuses another reconcile in that loader process; preserve and inspect its evidence.
+The reconcile response remains synchronous, not a durable acceptance receipt.
 
 If recovery fails, preserve the receipt, activation journal and evidence.
 Unknown process outcomes keep admission closed. A subsequent changed boot can

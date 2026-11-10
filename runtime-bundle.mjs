@@ -268,15 +268,18 @@ export async function stageImageBundle(manifestFile, releases, options = {}) {
       if (!info.isSymbolicLink() || await imageFs.readlink(join('/', entry.path)) !== entry.target) throw Error('Image release link mismatch');
     // Synthetic ancestors use canonical inventory modes; application entries
     // must have their exact signed source modes before sealing.
-    } else if ((!included ? entry.type !== 'directory' || entry.mode !== 0o700 || info.mode & 0o022 : (info.mode & 0o777) !== entry.mode) || (entry.type === 'directory' ? !info.isDirectory() : !info.isFile() || info.nlink !== 1 || info.size !== entry.size))
+    } else if ((!included ? entry.type !== 'directory' || entry.mode !== 0o700 || info.mode & 0o022 : (info.mode & 0o777) !== entry.mode) || (entry.type === 'directory' ? !info.isDirectory() : !info.isFile() || info.size !== entry.size))
       throw Error('Image release entry mismatch');
   };
+  // Image layers may preserve dependency-store hardlinks. Only read their bytes:
+  // the destination is a new inode, checked against the signed digest and sealed.
+  // Installed release verification continues to require single-link files.
   const copy = async (entry, target) => {
     const source = await imageFs.open(join('/', entry.path), constants.O_RDONLY | constants.O_NOFOLLOW);
     let output;
     try {
       const info = await source.stat();
-      if (!info.isFile() || info.nlink !== 1 || info.size !== entry.size || (info.mode & 0o777) !== entry.mode) throw Error('Image release file mismatch');
+      if (!info.isFile() || info.size !== entry.size || (info.mode & 0o777) !== entry.mode) throw Error('Image release file mismatch');
       output = await open(target, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
       const bytes = Buffer.alloc(65536); let position = 0;
       for (;;) {

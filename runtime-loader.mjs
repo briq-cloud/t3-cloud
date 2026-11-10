@@ -61,6 +61,7 @@ export async function startLoader(env = process.env, {
   const driver = createDriver(env);
   const supervisor = createSupervisor({ state, baseImage, driver });
   let updates, recoveryServer, closing, controllerIdentity, controllerRecovery, controllerFault = false, bootstrapSource = null, transition, updateScheduled = false;
+  let recoveryOperation = null;
   const fenceAdmission = () => { controllerFault = true; supervisor.admitting = false; for (const listener of listeners) listener.fence(); };
   const createController = async recovery => {
     const current = supervisor.journal.current;
@@ -101,18 +102,33 @@ export async function startLoader(env = process.env, {
     if (method === 'status' && migrationPending && recoveryServer) {
       try { migration = await readMigration(state) ?? { phase: 'invalid' }; } catch { migration = { phase: 'invalid' }; }
     }
-    if (method === 'status') return { ...await updates.status(), recovery: { ownership: ownership.evidence, ownershipRevision: ownership.revision, journalRevision: supervisor.journal.revision ?? 0, bindingsQuarantined: Boolean(supervisor.journal.recovery), required: Boolean(recoveryServer), available: migrationPending ? migration.phase !== 'invalid' : supervisor.recoverable(), ...(migrationPending && recoveryServer ? { migration: { id: migration.id, revision: migration.revision } } : {}) } };
+    if (method === 'status') {
+      const status = await updates.status();
+      return { ...status, busy: Boolean(status.busy || supervisor.busy || recoveryOperation?.outcome === 'in-progress'), recovery: { ownership: ownership.evidence, ownershipRevision: ownership.revision, journalRevision: supervisor.journal.revision ?? 0, bindingsQuarantined: Boolean(supervisor.journal.recovery), required: Boolean(recoveryServer), available: !['in-progress', 'unresolved'].includes(recoveryOperation?.outcome) && (migrationPending ? migration.phase !== 'invalid' : supervisor.recoverable()), ...(migrationPending && recoveryServer ? { migration: { id: migration.id, revision: migration.revision } } : {}), ...(recoveryOperation ? { operation: { ...recoveryOperation, processLocal: true } } : {}) } };
+    }
     if (method === 'reconcile') {
       if (!recoveryServer || closing) throw Error('Recovery management unavailable');
       // The recovery surface owns 8084; the explicitly recovered manager uses
       // 8082. Close it after the HTTP acknowledgement has been forwarded.
-      if (migrationPending) await recoverMigration({ state, env, source: bootstrapSource, baseImage, supervisor, ownership, input: enabled });
-      else await supervisor.reconcile(enabled);
-      migration = await readMigration(state);
-      const prior = recoveryServer; recoveryServer = null;
-      setImmediate(() => prior.close());
-      await replaceController(controllerRecovery);
-      return operations('status');
+      if (supervisor.busy || ['in-progress', 'unresolved'].includes(recoveryOperation?.outcome)) throw Error('Recovery outcome requires inspection');
+      recoveryOperation = { outcome: 'in-progress', stage: 'validating', error: null };
+      try {
+        if (migrationPending) await recoverMigration({ state, env, source: bootstrapSource, baseImage, supervisor, ownership, input: enabled,
+          onStage: stage => { recoveryOperation.stage = stage; } });
+        else { recoveryOperation.stage = 'recovering'; await supervisor.reconcile(enabled); }
+        migration = await readMigration(state);
+        recoveryOperation.stage = 'controller';
+        const prior = recoveryServer; recoveryServer = null;
+        setImmediate(() => prior.close());
+        await replaceController(controllerRecovery);
+        recoveryOperation = { ...recoveryOperation, outcome: 'completed', stage: 'completed' };
+        return operations('status');
+      } catch (error) {
+        // A rejected call may already have copied or published bytes. Never expose
+        // raw errors or present the failure as permission to replay the mutation.
+        recoveryOperation = { ...recoveryOperation, outcome: 'unresolved', error: 'recovery-outcome-unresolved' };
+        throw error;
+      }
     }
     if (migrationPending && recoveryServer) throw Error('Initial bootstrap recovery required');
     if (method === 'check') return updates.check();

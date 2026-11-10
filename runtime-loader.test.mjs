@@ -26,7 +26,7 @@ async function unusedPort() {
   const server = createServer(); server.listen(0, '127.0.0.1'); await once(server, 'listening');
   const port = server.address().port; await new Promise(resolve => server.close(resolve)); return port;
 }
-async function fixture(t, { recovery = false, unknown = false, journal, ownershipEvidence, bootstrapMigration = false, releaseController = false, expectedCloseFailure = false } = {}) {
+async function fixture(t, { recovery = false, unknown = false, journal, ownershipEvidence, bootstrapMigration = false, releaseController = false, expectedCloseFailure = false, recoveryMaterialize, controllerInitialize } = {}) {
   const state = await mkdtemp(join(tmpdir(), 't3-loader-integration-'));
   let loader;
   t.after(async () => {
@@ -126,12 +126,12 @@ async function fixture(t, { recovery = false, unknown = false, journal, ownershi
       identity: async () => testIdentity, stage: async () => ({ identity, path: '/staged-fixture' }), verify: async () => ({ ...manifest, baseImage: `sha256:${'c'.repeat(64)}` }) });
     }
   }
-  let starts = 0, updateWork, controllerWork, controllerTerminal; const recoveries = [], controllers = [];
+  let starts = 0, updateWork, controllerWork, controllerTerminal, reconcileWork; const recoveries = [], controllers = [];
   const port = await unusedPort();
   loader = await startLoader({ PORT: String(port), T3_HOST: '127.0.0.1', T3_CWD: state, T3_CLOUD_STATE: state,
     T3_CLOUD_PUBLIC_ORIGIN: origin, T3_CLOUD_OWNER_KEY: key, T3_CLOUD_OWNER_ID: 'owner', T3_CLOUD_CHILD_IMAGE: childImage }, {
     baseImageFile, sourceFile, acquireOwnership: bootstrapMigration ? migratedOwnership : ownershipEvidence ? options => acquireRuntimeOwnership({ ...options, lock: testLock, identity: async () => ({ ...testIdentity, ...(ownershipEvidence === 'cold' ? { bootId: '22222222-2222-2222-2222-222222222222' } : {}) }) }) : testOwnership,
-    recoverMigration: options => recoverBootstrapMigration({ ...options, identity: async () => ({ ...testIdentity, bootId: '22222222-2222-2222-2222-222222222222' }), acquireOwnership: migratedOwnership, ...(materialize ? { materialize } : {}) }),
+    recoverMigration: options => recoverBootstrapMigration({ ...options, identity: async () => ({ ...testIdentity, bootId: '22222222-2222-2222-2222-222222222222' }), acquireOwnership: migratedOwnership, ...(materialize ? { materialize: recoveryMaterialize ? (...args) => recoveryMaterialize(() => materialize(...args)) : materialize } : {}) }),
     createDriver: env => runtimeProcess(env, { spawnProcess: (_command, _args, options) => {
       starts++; recoveries.push(options.env.T3_CLOUD_RECOVERY); return spawn(process.execPath, [childFile], options);
     } }),
@@ -150,19 +150,29 @@ async function fixture(t, { recovery = false, unknown = false, journal, ownershi
       const updates = new RuntimeUpdates({ ...options, schedule: () => ({ unref() {} }), cancel() {},
       consumer: { check: async () => ({ tag: `runtime-${source}`, source, publishedAt: '2026-11-09T00:00:00Z', sizes: {} }),
         stage: () => options.stage('/bounded/manifest', '/bounded/blobs') } });
+      if (controllerInitialize) {
+        const initialize = updates.initialize.bind(updates);
+        updates.initialize = async () => { await controllerInitialize(options); return initialize(); };
+      }
       const update = updates.update.bind(updates); updates.update = () => (updateWork = update()); return updates;
     },
-    createRecoveryManager: options => createCloudManager(options),
+    createRecoveryManager: options => {
+      const reconcile = options.runtimeUpdates.reconcile;
+      options.runtimeUpdates.reconcile = input => {
+        const work = reconcile(input); reconcileWork ??= work; return work;
+      };
+      return createCloudManager(options);
+    },
   });
-  const send = async (path, { method = 'GET', input, auth = true, requestOrigin = origin, cookie } = {}) => {
-    const response = await fetch(`http://127.0.0.1:${port}${path}`, { method,
+  const send = async (path, { method = 'GET', input, auth = true, requestOrigin = origin, cookie, signal } = {}) => {
+    const response = await fetch(`http://127.0.0.1:${port}${path}`, { method, signal,
       headers: { ...(auth ? { authorization: `Bearer ${key}` } : {}), ...(cookie ? { cookie } : {}),
         ...(method === 'POST' ? { origin: requestOrigin, 'content-type': 'application/json' } : {}) },
       ...(method === 'POST' ? { body: JSON.stringify(input ?? {}) } : {}) });
     const text = await response.text();
     return { status: response.status, headers: response.headers, text, value: (() => { try { return JSON.parse(text); } catch { return null; } })() };
   };
-  return { state, port, loader, send, recoveries, controllers, selectedIdentity, controllerTerminal: () => controllerTerminal(), waitController: async () => { await new Promise(resolve => setImmediate(resolve)); await controllerWork; }, starts: () => starts, waitUpdate: async () => { await new Promise(resolve => setImmediate(resolve)); await updateWork; } };
+  return { state, port, loader, send, recoveries, waitReconcile: async () => { assert.ok(reconcileWork); await reconcileWork; }, controllers, selectedIdentity, controllerTerminal: () => controllerTerminal(), waitController: async () => { await new Promise(resolve => setImmediate(resolve)); await controllerWork; }, starts: () => starts, waitUpdate: async () => { await new Promise(resolve => setImmediate(resolve)); await updateWork; } };
 }
 
 test('authenticated owner update crosses real IPC; drain status stays available and committed receipt survives manager replacement', async t => {
@@ -219,7 +229,6 @@ test('owner cold reconciliation CAS recovers verified current and preserves stag
     expectedOwnershipRevision: status.recovery.ownershipRevision };
   assert.equal((await f.send('/_cloud/updates/reconcile', { method: 'POST', input, auth: false })).status, 401);
   assert.equal((await f.send('/_cloud/updates/reconcile', { method: 'POST', input, requestOrigin: 'https://evil.example' })).status, 403);
-  assert.notEqual((await f.send('/_cloud/updates/reconcile', { method: 'POST', input: { ...input, expectedJournalRevision: 9 } })).status, 200);
   assert.equal(f.starts(), 0);
   assert.equal((await f.send('/_cloud/updates/reconcile', { method: 'POST', input })).status, 200);
   assert.equal(f.starts(), 1); assert.deepEqual(f.recoveries, ['1']);
@@ -343,11 +352,108 @@ test('protocol-2 metadata migration crosses real management parser, read-only co
   assert.equal((await f.send('/_cloud/updates/reconcile', { method: 'POST', input, auth: false })).status, 401);
   assert.equal((await f.send('/_cloud/updates/reconcile', { method: 'POST', input, requestOrigin: 'https://evil.example' })).status, 403);
   assert.equal((await f.send('/_cloud/updates/reconcile', { method: 'POST', input: { ...input, imageRoot: '/tmp/other' } })).status, 400);
-  assert.equal((await f.send('/_cloud/updates/reconcile', { method: 'POST', input: { ...input, expectedMigrationRevision: 99 } })).status, 503);
   assert.equal(f.starts(), 0);
   const response = await f.send('/_cloud/updates/reconcile', { method: 'POST', input });
   assert.equal(response.status, 200); assert.equal(f.starts(), 1); assert.deepEqual(f.recoveries, ['1']);
   assert.equal(f.loader.supervisor.journal.current, f.selectedIdentity);
   assert.equal(JSON.parse(await readFile(receiptFile, 'utf8')).phase, 'completed');
   assert.equal(f.loader.supervisor.admitting, true);
+});
+
+
+test('bootstrap materialization remains visibly busy after its HTTP caller disconnects and rejects concurrent recovery', async t => {
+  let entered, finish, controllerEntered, finishController, calls = 0;
+  const started = new Promise(resolve => { entered = resolve; });
+  const gate = new Promise(resolve => { finish = resolve; });
+  const controllerStarted = new Promise(resolve => { controllerEntered = resolve; });
+  const controllerGate = new Promise(resolve => { finishController = resolve; });
+  t.after(() => { finish(); finishController(); });
+  const f = await fixture(t, { bootstrapMigration: 'metadata', recoveryMaterialize: async copy => {
+    calls++; entered(); await gate; return copy();
+  }, controllerInitialize: async options => {
+    if (!options.recovery) { controllerEntered(); await controllerGate; }
+  } });
+  const before = (await f.send('/_cloud/updates/status')).value;
+  const input = { action: 'recover-bootstrap-migration', expectedMigrationId: before.recovery.migration.id,
+    expectedMigrationRevision: before.recovery.migration.revision, expectedJournalRevision: before.recovery.journalRevision,
+    expectedOwnershipRevision: before.recovery.ownershipRevision };
+  const abort = new AbortController();
+  const request = f.send('/_cloud/updates/reconcile', { method: 'POST', input, signal: abort.signal });
+  const disconnected = assert.rejects(request, error => error.name === 'AbortError');
+  await started; abort.abort(); await disconnected;
+  const during = (await f.send('/_cloud/updates/status')).value;
+  assert.equal(during.busy, true);
+  assert.deepEqual(during.recovery.operation, { outcome: 'in-progress', stage: 'materializing', error: null, processLocal: true });
+  assert.equal(during.phase, 'stopped'); assert.equal(during.recovery.available, false);
+  assert.equal(JSON.parse(await readFile(join(f.state, 'updates/bootstrap-migration.json'), 'utf8')).phase, 'metadata-prepared');
+  assert.equal((await f.send('/_cloud/updates/reconcile', { method: 'POST', input })).status, 503);
+  assert.equal((await f.send('/_cloud/updates/status')).value.recovery.operation.outcome, 'in-progress');
+  assert.equal(calls, 1); assert.equal(f.starts(), 0);
+  assert.equal((await f.send('/native')).status, 503);
+  // Join the operation owned by the recovery manager, including controller replacement.
+  let reconciled = false;
+  const completion = f.waitReconcile().then(() => { reconciled = true; });
+  finish(); await controllerStarted;
+  await Promise.resolve();
+  assert.equal(reconciled, false);
+  finishController(); await completion;
+  assert.equal(reconciled, true);
+  const after = (await f.send('/_cloud/updates/status')).value;
+  assert.equal(after.busy, false); assert.equal(after.phase, 'running');
+  assert.equal(after.recovery.operation.outcome, 'completed');
+  assert.equal(f.starts(), 1); assert.equal(calls, 1);
+});
+
+test('failed bootstrap materialization leaves a sanitized unresolved outcome and admission closed', async t => {
+  let calls = 0;
+  const f = await fixture(t, { bootstrapMigration: 'metadata', recoveryMaterialize: async () => {
+    calls++; throw Error('secret filesystem path and credential must stay private');
+  } });
+  const before = (await f.send('/_cloud/updates/status')).value;
+  const input = { action: 'recover-bootstrap-migration', expectedMigrationId: before.recovery.migration.id,
+    expectedMigrationRevision: before.recovery.migration.revision, expectedJournalRevision: before.recovery.journalRevision,
+    expectedOwnershipRevision: before.recovery.ownershipRevision };
+  assert.equal((await f.send('/_cloud/updates/reconcile', { method: 'POST', input })).status, 503);
+  const status = await f.send('/_cloud/updates/status');
+  assert.equal(status.value.busy, false);
+  assert.deepEqual(status.value.recovery.operation, { outcome: 'unresolved', stage: 'materializing', error: 'recovery-outcome-unresolved', processLocal: true });
+  assert.equal(status.text.includes('credential'), false);
+  assert.equal(status.value.recovery.available, false);
+  assert.equal((await f.send('/_cloud/updates/reconcile', { method: 'POST', input })).status, 503);
+  assert.equal(calls, 1);
+  assert.equal(f.starts(), 0); assert.equal((await f.send('/native')).status, 503);
+  assert.equal(JSON.parse(await readFile(join(f.state, 'updates/bootstrap-migration.json'), 'utf8')).phase, 'metadata-prepared');
+});
+
+
+test('failed current-version recovery disables availability and refuses another same-process start', async t => {
+  const f = await fixture(t, { ownershipEvidence: 'cold', journal: { protocol: 1, revision: 10, current: 'bootstrap',
+    desired: null, staged: identity, phase: 'running', receipt: null } });
+  f.loader.supervisor.driver.health = async () => { throw Error('private health detail'); };
+  const before = (await f.send('/_cloud/updates/status')).value;
+  const input = { action: 'recover-known-current', expectedJournalRevision: before.recovery.journalRevision,
+    expectedOwnershipRevision: before.recovery.ownershipRevision };
+  assert.equal((await f.send('/_cloud/updates/reconcile', { method: 'POST', input })).status, 503);
+  const after = (await f.send('/_cloud/updates/status')).value;
+  assert.equal(after.recovery.available, false); assert.equal(after.busy, false);
+  assert.deepEqual(after.recovery.operation, { outcome: 'unresolved', stage: 'recovering', error: 'recovery-outcome-unresolved', processLocal: true });
+  assert.equal(f.starts(), 1); assert.equal(f.loader.supervisor.admitting, false);
+  assert.equal((await f.send('/_cloud/updates/reconcile', { method: 'POST', input: {
+    ...input, expectedJournalRevision: after.recovery.journalRevision, expectedOwnershipRevision: after.recovery.ownershipRevision,
+  } })).status, 503);
+  assert.equal(f.starts(), 1); assert.equal((await f.send('/native')).status, 503);
+});
+
+for (const bootstrap of [false, true]) test(`stale ${bootstrap ? 'bootstrap' : 'current-version'} recovery CAS fails closed for this process`, async t => {
+  const f = await fixture(t, bootstrap ? { bootstrapMigration: 'metadata' } : { ownershipEvidence: 'cold', journal: {
+    protocol: 1, revision: 10, current: 'bootstrap', desired: null, staged: identity, phase: 'running', receipt: null,
+  } });
+  const before = (await f.send('/_cloud/updates/status')).value;
+  const input = { action: bootstrap ? 'recover-bootstrap-migration' : 'recover-known-current',
+    ...(bootstrap ? { expectedMigrationId: before.recovery.migration.id, expectedMigrationRevision: before.recovery.migration.revision } : {}),
+    expectedJournalRevision: before.recovery.journalRevision, expectedOwnershipRevision: before.recovery.ownershipRevision };
+  assert.equal((await f.send('/_cloud/updates/reconcile', { method: 'POST', input: { ...input, expectedJournalRevision: before.recovery.journalRevision + 1 } })).status, 503);
+  assert.equal((await f.send('/_cloud/updates/status')).value.recovery.available, false);
+  assert.equal((await f.send('/_cloud/updates/reconcile', { method: 'POST', input })).status, 503);
+  assert.equal(f.starts(), 0);
 });

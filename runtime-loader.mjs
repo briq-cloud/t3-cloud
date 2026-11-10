@@ -14,7 +14,7 @@ export function loaderFrontdoor({ port, host, target, admitting, managing = () =
   const sockets = new Set();
   const server = createServer((req, res) => {
     let management = false;
-    try { management = ['/_cloud', '/_cloud/', '/_cloud/login', '/_cloud/logout', '/_cloud/updates', '/_cloud/updates/status', '/_cloud/updates/check', '/_cloud/updates/update', '/_cloud/updates/automatic', '/_cloud/updates/reconcile'].includes(new URL(req.url, 'http://localhost').pathname); } catch {}
+    try { management = ['/_cloud', '/_cloud/', '/_cloud/health', '/_cloud/login', '/_cloud/logout', '/_cloud/updates', '/_cloud/updates/status', '/_cloud/updates/check', '/_cloud/updates/update', '/_cloud/updates/automatic', '/_cloud/updates/reconcile'].includes(new URL(req.url, 'http://localhost').pathname); } catch {}
     if (!admitting() && !(management && managing())) { res.writeHead(503, { 'cache-control': 'no-store', connection: 'close' }); return res.end(); }
     // Preserve the original Host/Origin/cookies. Existing manager/frontdoor
     // authorization and WebSocket validation run behind this byte-forwarder.

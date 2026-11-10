@@ -8,7 +8,7 @@ import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { acquireRuntimeOwnership } from './runtime-ownership.mjs';
 import { testIdentity, testLock, testOwnership } from './fixtures/runtime-ownership.mjs';
-import { startLoader } from './runtime-loader.mjs';
+import { loaderFrontdoor, startLoader } from './runtime-loader.mjs';
 import { prepareBootstrapMigration, prepareBootstrapMetadata, recoverBootstrapMigration } from './runtime-bootstrap-migration.mjs';
 import { createHash } from 'node:crypto';
 import { runtimeProcess } from './runtime-process.mjs';
@@ -175,6 +175,18 @@ async function fixture(t, { recovery = false, unknown = false, journal, ownershi
   return { state, port, loader, send, recoveries, waitReconcile: async () => { assert.ok(reconcileWork); await reconcileWork; }, controllers, selectedIdentity, controllerTerminal: () => controllerTerminal(), waitController: async () => { await new Promise(resolve => setImmediate(resolve)); await controllerWork; }, starts: () => starts, waitUpdate: async () => { await new Promise(resolve => setImmediate(resolve)); await updateWork; } };
 }
 
+test('management health is unavailable when the loader has no operational management target', async t => {
+ const port = await unusedPort();
+ let managing = false;
+ const frontdoor = loaderFrontdoor({ port, host: '127.0.0.1', target: 1, admitting: () => false, managing: () => managing });
+ await frontdoor.listen(); t.after(() => frontdoor.close());
+ const response = await fetch(`http://127.0.0.1:${port}/_cloud/health`);
+ assert.equal(response.status, 503); await response.text();
+ managing = true;
+ const unavailable = await fetch(`http://127.0.0.1:${port}/_cloud/health`);
+ assert.equal(unavailable.status, 502); await unavailable.text();
+});
+
 test('authenticated owner update crosses real IPC; drain status stays available and committed receipt survives manager replacement', async t => {
   const f = await fixture(t);
   assert.equal((await f.send('/_cloud/updates/status', { auth: false })).status, 401);
@@ -207,6 +219,19 @@ test('authenticated owner update crosses real IPC; drain status stays available 
 test('ambiguous restart exposes only owner-authenticated recovery UI without starting native or central runtime', async t => {
   const f = await fixture(t, { recovery: true, unknown: true });
   assert.equal(f.starts(), 0); assert.equal(f.loader.status.recoveryRequired, true);
+  const health = await f.send('/_cloud/health', { auth: false });
+  assert.equal(health.status, 200); assert.deepEqual(health.value, { surface: 'management', status: 'ok' });
+  assert.equal(health.headers.get('cache-control'), 'no-store');
+  assert.notEqual((await f.send('/_cloud/health', { method: 'POST', auth: false })).status, 200);
+  assert.equal((await f.send('/_cloud/capabilities', { auth: false })).status, 503);
+  assert.equal((await f.send('/.well-known/t3/environment', { auth: false })).status, 503);
+  const socket = connect(f.port, '127.0.0.1');
+  t.after(() => socket.destroy());
+  let reply = ''; socket.on('data', chunk => { reply += chunk; });
+  const ended = once(socket, 'end');
+  socket.write('GET /native HTTP/1.1\r\nHost: cloud.example\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n');
+  await ended; assert.match(reply, /^HTTP\/1\.1 503 /);
+  assert.equal(f.starts(), 0);
   assert.equal((await f.send('/_cloud/')).status, 200);
   assert.equal((await f.send('/_cloud/updates/status', { auth: false })).status, 401);
   const status = await f.send('/_cloud/updates/status');
@@ -340,6 +365,9 @@ test('prepared bootstrap migration stays management-only until owner action cros
 
 test('protocol-2 metadata migration crosses real management parser, read-only controller and fenced loader before explicit recovery', async t => {
   const f = await fixture(t, { bootstrapMigration: 'metadata', releaseController: true });
+  const health = await f.send('/_cloud/health', { auth: false });
+  assert.equal(health.status, 200); assert.deepEqual(health.value, { surface: 'management', status: 'ok' });
+  assert.equal(f.starts(), 0);
   const receiptFile = join(f.state, 'updates/bootstrap-migration.json');
   assert.equal(JSON.parse(await readFile(receiptFile, 'utf8')).phase, 'metadata-prepared');
   assert.equal(f.starts(), 0); assert.equal((await f.send('/native')).status, 503);
@@ -385,6 +413,10 @@ test('bootstrap materialization remains visibly busy after its HTTP caller disco
   assert.equal(during.busy, true);
   assert.deepEqual(during.recovery.operation, { outcome: 'in-progress', stage: 'materializing', error: null, processLocal: true });
   assert.equal(during.phase, 'stopped'); assert.equal(during.recovery.available, false);
+  const healthDuringCopy = await f.send('/_cloud/health', { auth: false });
+  assert.equal(healthDuringCopy.status, 200);
+  assert.deepEqual(healthDuringCopy.value, { surface: 'management', status: 'ok' });
+  assert.equal((await f.send('/.well-known/t3/environment', { auth: false })).status, 503);
   assert.equal(JSON.parse(await readFile(join(f.state, 'updates/bootstrap-migration.json'), 'utf8')).phase, 'metadata-prepared');
   assert.equal((await f.send('/_cloud/updates/reconcile', { method: 'POST', input })).status, 503);
   assert.equal((await f.send('/_cloud/updates/status')).value.recovery.operation.outcome, 'in-progress');

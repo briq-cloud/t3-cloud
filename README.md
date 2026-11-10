@@ -12,6 +12,7 @@ upstream source and verified release artifacts.
 ## Connections
 
 The public listener serves native T3 at `/` and owner connection management at `/_cloud/`.
+`GET /_cloud/health` checks the management surface, including during recovery. It does not report native runtime readiness.
 Native T3 retains its own authentication. The manager uses a separate owner key and an opaque,
 12-hour HttpOnly, SameSite=Strict session cookie (Secure on HTTPS). It never treats a gateway
 header as the owner. Management mutations require the configured public Origin.

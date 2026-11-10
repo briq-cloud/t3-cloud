@@ -9,7 +9,7 @@ const key = 'owner-key-for-test-only-1234567890123456';
 const allocationKey = 'allocation-key-test-only-1234567890123456';
 const origin = 'https://cloud.example';
 const connections = { status: async () => ({claude: { authenticated: false }, briq: { authenticated: null }}), pair: async () => ({pairUrl: 'https://cloud.example/pair#token=short-lived'}) };
-async function fixture(t, revocationIssues, ownerRequest, restorationIssues) {
+async function fixture(t, revocationIssues, ownerRequest, restorationIssues, options = {}) {
   const seen = [];
   const upstream = createServer((req,res) => { seen.push(req.headers); res.setHeader('content-type','text/plain; charset=utf-8'); res.setHeader('x-content-type-options','nosniff'); res.setHeader('set-cookie',['native=ok','t3_cloud_owner=forged','briq_token=forged']); res.end(req.url); });
   upstream.on('upgrade', (req,socket,head) => { seen.push(req.headers); socket.write('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n'); if(head.length)socket.write(head); socket.pipe(socket); });
@@ -21,13 +21,28 @@ async function fixture(t, revocationIssues, ownerRequest, restorationIssues) {
       async pairChild(owner,thread,allocation){phoneCalls.push(['pair',owner,thread,allocation]);return{url:'https://child.example',code:'fresh-test-only',expiresAt:new Date(Date.now()+290000).toISOString()};},
       async allocate(owner,thread,provider){allocations.push([owner,thread,provider]); return {threadId:thread,connection:{url:'https://child.example',credential:'one-time'}};}},
     broker:{async ownerRequest(method,params){rpc.push([method,params]);if(ownerRequest)return ownerRequest(method,params); return method==='account/login/start'?{type:'chatgptDeviceCode',loginId:'native-login',userCode:'TEST-CODE',verificationUrl:'https://auth.example/device',accessToken:'never-export'}:{account:null};}},
-    t3Target:`http://127.0.0.1:${upstream.address().port}`,terminalTarget:`http://127.0.0.1:${upstream.address().port}`});
+    t3Target:`http://127.0.0.1:${upstream.address().port}`,terminalTarget:`http://127.0.0.1:${upstream.address().port}`, ...options});
   manager.listen(0,'127.0.0.1');await once(manager,'listening');
   t.after(()=>{manager.closeAllConnections();manager.close();upstream.closeAllConnections();upstream.close();});
   function send(path,{method='GET',headers={},body}={}){return new Promise((resolve,reject)=>{const req=request({hostname:'127.0.0.1',port:manager.address().port,path,method,headers},res=>{let text='';res.on('data',c=>text+=c);res.on('end',()=>resolve({status:res.statusCode,headers:res.headers,text}));});req.on('error',reject);req.end(body===undefined?undefined:JSON.stringify(body));});}
   const post=(path,body={},headers={})=>send(path,{method:'POST',body,headers:{origin,'content-type':'application/json',...headers}});
   return {seen,allocations,rpc,phoneCalls,manager,send,post};
 }
+test('management health is public and independent of native admission and readiness', async t => {
+ let admitting = true, ready = true;
+ const f = await fixture(t, undefined, undefined, undefined, { nativeAdmitting: () => admitting, ready: () => ready });
+ for (const fenced of [false, true]) {
+  admitting = !fenced; ready = !fenced;
+  const r = await f.send('/_cloud/health');
+  assert.equal(r.status, 200); assert.deepEqual(JSON.parse(r.text), { surface: 'management', status: 'ok' });
+  assert.equal(r.headers['cache-control'], 'no-store');
+ }
+ assert.equal((await f.send('/native')).status, 503);
+ assert.equal((await f.send('/.well-known/t3/environment')).status, 503);
+ assert.equal((await f.send('/_cloud/capabilities')).status, 503);
+ assert.notEqual((await f.post('/_cloud/health')).status, 200);
+ assert.deepEqual(f.seen, []); assert.deepEqual(f.rpc, []);
+});
 test('owner bootstrap creates secure opaque cookie; rejects cross-origin mutations',async t=>{
  const f=await fixture(t);let r=await f.send('/_cloud/');assert.equal(r.status,200);assert(!r.text.includes(key));assert.match(r.headers['content-security-policy'],/nonce-/);
  r=await f.post('/_cloud/login',{key},{origin:'https://evil.example'});assert.equal(r.status,403);

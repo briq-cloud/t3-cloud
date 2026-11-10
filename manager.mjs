@@ -26,7 +26,7 @@ async function body(req) {
 const only = (value, keys) => Object.keys(value).every(key => keys.includes(key));
 const id = value => typeof value === 'string' && /^[a-zA-Z0-9_-]{1,128}$/.test(value);
 export function runtimeManagementPath(path) {
-  return ['/_cloud', '/_cloud/', '/_cloud/login', '/_cloud/logout', '/_cloud/updates', '/_cloud/updates/status', '/_cloud/updates/check', '/_cloud/updates/update', '/_cloud/updates/automatic', '/_cloud/updates/reconcile'].includes(path);
+  return ['/_cloud', '/_cloud/', '/_cloud/health', '/_cloud/login', '/_cloud/logout', '/_cloud/updates', '/_cloud/updates/status', '/_cloud/updates/check', '/_cloud/updates/update', '/_cloud/updates/automatic', '/_cloud/updates/reconcile'].includes(path);
 }
 const denySocket = socket => { socket.end('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n'); };
 
@@ -45,11 +45,13 @@ export function createCloudManager({ role, publicOrigin, ownerKey, ownerId, allo
   const updateRequests = new Set();
   const server = createServer(async (req, res) => {
     let management = false;
-    try { management = runtimeUpdates && runtimeManagementPath(new URL(req.url, auth.origin).pathname); } catch {}
+    try { const path = new URL(req.url, auth.origin).pathname; management = (runtimeUpdates || req.method === 'GET' && path === '/_cloud/health') && runtimeManagementPath(path); } catch {}
     if (!management) { updateRequests.add(res); res.once('close', () => updateRequests.delete(res)); }
     try {
       const url = new URL(req.url, auth.origin);
-      const management = runtimeUpdates && runtimeManagementPath(url.pathname);
+      const management = (runtimeUpdates || req.method === 'GET' && url.pathname === '/_cloud/health') && runtimeManagementPath(url.pathname);
+      // This checks the management surface, not native runtime readiness.
+      if (url.pathname === '/_cloud/health' && req.method === 'GET') return json(res, 200, { surface: 'management', status: 'ok' });
       if ((managementOnly || !nativeAdmitting()) && !management) return json(res, 503, { error: 'Native admission is closed' });
       if (url.pathname === '/_cloud/briq/mcp') {
         if (role !== 'central' || !briqMcpRequest) return json(res, 404, { error: 'Unavailable' });

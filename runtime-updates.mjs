@@ -2,7 +2,7 @@ import { constants } from 'node:fs';
 import { mkdir, mkdtemp, open, rm } from 'node:fs/promises';
 import { isAbsolute, join } from 'node:path';
 import { durableJson } from './runtime-supervisor.mjs';
-import { verifyManifestAttestation, RUNTIME_ATTESTATION_ASSET, MAX_RUNTIME_ATTESTATION_BYTES } from './runtime-bundle.mjs';
+import { verifyManifestAttestation, checkRuntimeDownloadCapacity, RUNTIME_ATTESTATION_ASSET, MAX_RUNTIME_ATTESTATION_BYTES } from './runtime-bundle.mjs';
 import { MAX_RUNTIME_ARCHIVE_BYTES, verifyAndUnpackRuntimeArchive } from './bin/runtime-archive.mjs';
 
 const API = 'https://api.github.com/repos/briq-cloud/t3-cloud/releases?per_page=10';
@@ -78,7 +78,7 @@ export async function readReleaseAsset(url, { limit, expectedSize, file, fetch: 
 }
 
 export function runtimeReleaseConsumer({ state, stage, fetch: fetcher = globalThis.fetch,
-  verifyManifest = verifyManifestAttestation, verifyArchive = verifyAndUnpackRuntimeArchive } = {}) {
+  verifyManifest = verifyManifestAttestation, verifyArchive = verifyAndUnpackRuntimeArchive, space } = {}) {
   if (!isAbsolute(state) || typeof stage !== 'function') throw Error('Runtime release dependencies required');
   return {
     async check() {
@@ -101,6 +101,7 @@ export function runtimeReleaseConsumer({ state, stage, fetch: fetcher = globalTh
           if (name === 'manifest.json') {
             ({ manifest } = await verifyManifest(join(scratch, name)));
             if (manifest.source !== selected.source) throw Error('Release source mismatch');
+            await checkRuntimeDownloadCapacity(manifest, scratch, selected.sizes['runtime-blobs.tar'], { space });
           }
         }
         // Core verification is repeated before stage by the supervisor itself.

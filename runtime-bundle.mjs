@@ -246,6 +246,38 @@ export async function stageBundle(manifestFile, blobs, releases, options) {
     (entry, target) => copyFile(join(blobs, entry.sha256), target, constants.COPYFILE_EXCL));
 }
 
+// Keep the initial image and downloaded update paths on the same reserve policy.
+function checkCapacity(space, bytes, entries, message) {
+  const required = bytes + (bytes + 9n) / 10n + 3n * 1073741824n;
+  if (space.bsize <= 0n || space.bavail < 0n || space.files <= 0n ||
+      space.ffree < entries + 4224n || space.bsize * space.bavail < required) throw Error(message);
+}
+
+export async function checkRuntimeDownloadCapacity(manifest, directory, archiveBytes, { space = statfs } = {}) {
+  validateManifest(manifest);
+  if (!Number.isSafeInteger(archiveBytes) || archiveBytes <= 0) throw Error('Invalid release archive size');
+  const available = await space(directory, { bigint: true });
+  const message = 'Insufficient runtime update capacity';
+  if (available.bsize <= 0n) throw Error(message);
+  const rounded = size => (BigInt(size) + available.bsize - 1n) / available.bsize * available.bsize;
+  const blobs = new Map();
+  let installed = 0n;
+  for (const entry of manifest.files) {
+    // Installed duplicate files are independent inodes; unpacked blobs deduplicate by digest.
+    installed += entry.type === 'file' ? rounded(entry.size) : available.bsize;
+    if (entry.type === 'file') {
+      if (blobs.has(entry.sha256) && blobs.get(entry.sha256) !== entry.size) throw Error('Conflicting release blob');
+      blobs.set(entry.sha256, entry.size);
+    }
+  }
+  const unpacked = [...blobs.values()].reduce((total, size) => total + rounded(size), 0n);
+  const archive = rounded(archiveBytes);
+  // The verification copy coexists with unpacked blobs, then is removed before
+  // installation. The original download and blobs remain until staging returns.
+  const peak = archive + unpacked + (archive > installed ? archive : installed);
+  checkCapacity(available, peak, BigInt(manifest.files.length + blobs.size), message);
+}
+
 // Initial migration only: fixed image paths are candidate bytes, never authority.
 // Dependency injection supplies filesystem fixtures; recovery accepts no source path.
 export async function stageImageBundle(manifestFile, releases, options = {}) {
@@ -296,10 +328,8 @@ export async function stageImageBundle(manifestFile, releases, options = {}) {
       if ((await readdir(releases)).some(name => name.startsWith(destination.split('/').at(-1) + '.staging-')))
         throw Error('Interrupted image materialization requires inspection');
       const installed = manifest.files.reduce((n, entry) => n + (entry.type === 'file' ? BigInt(entry.size) : 0n), 0n);
-      const required = installed + (installed + 9n) / 10n + 3n * 1073741824n;
       const space = await (options.space ?? statfs)(releases, { bigint: true });
-      if (space.bsize <= 0n || space.bavail < 0n || space.files <= 0n || space.ffree < BigInt(manifest.files.length + 4224) || space.bsize * space.bavail < required)
-        throw Error('Insufficient image materialization capacity');
+      checkCapacity(space, installed, BigInt(manifest.files.length), 'Insufficient image materialization capacity');
     } }, copy);
 }
 

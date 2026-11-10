@@ -1,7 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtemp, readFile, stat, rm, readdir } from 'node:fs/promises';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { REQUIRED_BUNDLE_PATHS } from './runtime-bundle.mjs';
 import { tmpdir } from 'node:os';
 import { RuntimeUpdates, readReleaseAsset, runtimeReleaseConsumer, selectRuntimeRelease } from './runtime-updates.mjs';
 
@@ -11,6 +12,15 @@ const release = () => ({ tag_name: `runtime-${source}`, draft: false, prerelease
   { name: 'manifest.json', size: 2, state: 'uploaded' }, { name: 'runtime-blobs.tar', size: 1024, state: 'uploaded' },
 ] });
 const selected = () => selectRuntimeRelease([release()]);
+function releaseManifest() {
+  const directories = new Set();
+  for (const path of REQUIRED_BUNDLE_PATHS) for (let parent = dirname(path); parent !== '.'; parent = dirname(parent)) directories.add(parent);
+  return { protocol: 1, project: 'briq-cloud/t3-cloud', platform: 'linux/amd64', baseImage: digest, source,
+    childImage: `ghcr.io/briq-cloud/t3-cloud@${digest}`, files: [
+      ...[...directories].map(path => ({ path, type: 'directory', mode: 0o700 })),
+      ...REQUIRED_BUNDLE_PATHS.map(path => ({ path, type: 'file', mode: 0o700, size: 1, sha256: 'd'.repeat(64) })),
+    ] };
+}
 const asset = name => `https://github.com/briq-cloud/t3-cloud/releases/download/runtime-${source}/${name}`;
 async function fixture(t, changes = {}) {
   const state = await mkdtemp(join(tmpdir(), 't3-update-test-'));
@@ -79,12 +89,13 @@ test('consumer pins manifest source before fetching archive and cleans failed do
 test('consumer verifies both assets before passing private paths to supervisor stage', async t => {
   const { state } = await fixture(t), order = [];
   const consumer = runtimeReleaseConsumer({ state,
+    space: async () => { order.push('capacity'); return { bsize: 4096n, bavail: 10000000n, files: 1000000n, ffree: 1000000n }; },
     fetch: async url => { order.push(url.endsWith('.tar') ? 'download-archive' : url.endsWith('.jsonl') ? 'download-evidence' : 'download-manifest'); return new Response(url.endsWith('.tar') ? Buffer.alloc(1024) : '{}'); },
-    verifyManifest: async file => { assert.equal(await readFile(join(file, '..', 'runtime-attestation.jsonl'), 'utf8'), '{}'); assert.equal((await stat(file)).mode & 0o777, 0o600); order.push('manifest-proof'); return { manifest: { source } }; },
+    verifyManifest: async file => { assert.equal(await readFile(join(file, '..', 'runtime-attestation.jsonl'), 'utf8'), '{}'); assert.equal((await stat(file)).mode & 0o777, 0o600); order.push('manifest-proof'); return { manifest: releaseManifest() }; },
     verifyArchive: async (_archive, _output, manifest) => { assert.equal(manifest.source, source); order.push('archive-proof'); },
     stage: async (file, blobs) => { assert.ok(file.startsWith(join(state, 'updates', 'download-'))); assert.equal(blobs, join(file, '..', 'blobs')); order.push('stage'); return { identity: digest }; } });
   assert.deepEqual(await consumer.stage(selected()), { identity: digest });
-  assert.deepEqual(order, ['download-evidence', 'download-manifest', 'manifest-proof', 'download-archive', 'archive-proof', 'stage']);
+  assert.deepEqual(order, ['download-evidence', 'download-manifest', 'manifest-proof', 'capacity', 'download-archive', 'archive-proof', 'stage']);
 });
 
 test('preferences default off and persist with private permissions across restart', async t => {
@@ -264,4 +275,21 @@ test('committed activation receipt repairs only exact selected-release preferenc
   await repaired.save({ outcome: 'pending' }); f.journal.phase = 'starting';
   const ambiguous = new RuntimeUpdates({ ...f.options, currentSource: source }); await ambiguous.initialize();
   assert.equal((await ambiguous.status()).outcome, 'pending');
+});
+
+test('signed-manifest capacity refusal fetches no archive and never stages, for bytes or inodes', async t => {
+  const { state } = await fixture(t);
+  for (const available of [{ bavail: 0n, ffree: 1000000n }, { bavail: 10000000n, ffree: 0n }]) {
+    const calls = [];
+    const consumer = runtimeReleaseConsumer({ state,
+      fetch: async url => { calls.push(url); return new Response('{}'); },
+      verifyManifest: async () => { calls.push('manifest-proof'); return { manifest: releaseManifest() }; },
+      space: async () => { calls.push('capacity'); return { bsize: 4096n, files: 1000000n, ...available }; },
+      verifyArchive: async () => { assert.fail('archive verification after capacity refusal'); },
+      stage: async () => { assert.fail('stage after capacity refusal'); },
+    });
+    await assert.rejects(consumer.stage(selected()), /Insufficient runtime update capacity/);
+    assert.deepEqual(calls, [asset('runtime-attestation.jsonl'), asset('manifest.json'), 'manifest-proof', 'capacity']);
+    assert.deepEqual((await readdir(join(state, 'updates'))).filter(name => name.startsWith('download-')), []);
+  }
 });

@@ -4,7 +4,7 @@ import { createHash } from 'node:crypto';
 import { chmod, lstat, mkdtemp, mkdir, readFile, readdir, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { BUNDLE_ROOTS, REQUIRED_BUNDLE_PATHS, packBundle, stageBundle, validateManifest, verifyManifestAttestation, verifyInstalledBundle } from './runtime-bundle.mjs';
+import { BUNDLE_ROOTS, REQUIRED_BUNDLE_PATHS, checkRuntimeDownloadCapacity, packBundle, stageBundle, validateManifest, verifyManifestAttestation, verifyInstalledBundle } from './runtime-bundle.mjs';
 
 async function cleanup(path) {
   const info = await lstat(path);
@@ -180,4 +180,41 @@ test('missing, oversized and symlinked attestation evidence fail before invoking
   await rm(bundleFile); await symlink(file, bundleFile);
   await assert.rejects(verifyManifestAttestation(file, options));
   assert.equal(calls, 0);
+});
+
+test('download capacity counts duplicate installations, unique blobs and both allocation peaks', async () => {
+  const manifest = fixture();
+  const fileCount = manifest.files.filter(entry => entry.type === 'file').length;
+  const directories = manifest.files.length - fileCount;
+  // Every fixture file has the same digest, so only one blob is unpacked.
+  const installed = BigInt(fileCount * contents.length + directories);
+  const inodes = BigInt(manifest.files.length + 1 + 4224);
+  for (const archive of [1n, 100000000n]) {
+    const peak = archive + BigInt(contents.length) + (archive > installed ? archive : installed);
+    const required = peak + (peak + 9n) / 10n + 3n * 1073741824n;
+    const available = { bsize: 1n, bavail: required, files: inodes, ffree: inodes };
+    const check = overrides => checkRuntimeDownloadCapacity(manifest, '/owned/update', Number(archive), {
+      space: async (path, options) => {
+        assert.equal(path, '/owned/update'); assert.deepEqual(options, { bigint: true });
+        return { ...available, ...overrides };
+      },
+    });
+    await check({});
+    await assert.rejects(check({ bavail: required - 1n }), /Insufficient runtime update capacity/);
+    await assert.rejects(check({ ffree: inodes - 1n }), /Insufficient runtime update capacity/);
+    await assert.rejects(check({ bsize: 0n }), /Insufficient runtime update capacity/);
+  }
+});
+
+test('download capacity rounds each installed file and unique blob to filesystem blocks', async () => {
+  const manifest = fixture(), block = 4096n, archive = 8192n;
+  const installed = BigInt(manifest.files.length) * block;
+  const peak = archive + block + installed;
+  const required = peak + (peak + 9n) / 10n + 3n * 1073741824n;
+  const blocks = (required + block - 1n) / block;
+  const check = bavail => checkRuntimeDownloadCapacity(manifest, '/owned/update', 4097, {
+    space: async () => ({ bsize: block, bavail, files: 1000000n, ffree: 1000000n }),
+  });
+  await check(blocks);
+  await assert.rejects(check(blocks - 1n), /Insufficient runtime update capacity/);
 });

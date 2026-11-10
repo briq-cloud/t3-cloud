@@ -114,6 +114,47 @@ test('real verifier failure prevents extraction; invocation pins source and iden
   await assert.rejects(stat(f.output), { code: 'ENOENT' });
 });
 
+test('archive verification uses a private independent snapshot on the download filesystem when TMPDIR is unusable', async t => {
+  const f = await fixture(t);
+  const sentinel = join(f.root, 'unsuitable-tmpdir');
+  await writeFile(sentinel, 'not a directory');
+  const previous = process.env.TMPDIR;
+  let snapshot;
+  try {
+    process.env.TMPDIR = sentinel;
+    await assert.rejects(verifyAndUnpackRuntimeArchive(f.archive, f.output, manifest(), { run: async (_cli, args) => {
+      snapshot = args[2];
+      const directory = dirname(snapshot), original = await stat(f.archive), copied = await stat(snapshot);
+      assert.equal(dirname(directory), dirname(f.archive));
+      assert.equal((await stat(directory)).mode & 0o777, 0o700);
+      assert.equal(copied.dev, original.dev);
+      assert.notEqual(copied.ino, original.ino);
+      assert.equal(copied.nlink, 1);
+      assert.deepEqual(await readFile(snapshot), await readFile(f.archive));
+      throw Error('Unverifiable archive');
+    } }), /Unverifiable archive/);
+  } finally {
+    if (previous === undefined) delete process.env.TMPDIR;
+    else process.env.TMPDIR = previous;
+  }
+  assert.equal(await readFile(sentinel, 'utf8'), 'not a directory');
+  await assert.rejects(stat(f.output), { code: 'ENOENT' });
+  await assert.rejects(stat(dirname(snapshot)), { code: 'ENOENT' });
+});
+
+test('archive verification refuses a writable download directory before creating scratch', async t => {
+  const f = await fixture(t);
+  const { chmod } = await import('node:fs/promises');
+  await chmod(f.root, 0o777);
+  try {
+    await assert.rejects(verifyAndUnpackRuntimeArchive(f.archive, f.output, manifest(), {
+      run: async () => assert.fail('unsafe directory must not reach verification'),
+    }), /Unsafe release archive directory/);
+    assert.equal((await readdir(f.root)).some(name => name.startsWith('t3-archive-verify-')), false);
+    await assert.rejects(stat(f.output), { code: 'ENOENT' });
+  } finally { await chmod(f.root, 0o700); }
+});
+
 test('large sparse archive gets its size-derived native budget; timeout prevents extraction', async t => {
   const f = await fixture(t);
   // Extending creates a hole, avoiding a material write of the published 1.4 GB asset.

@@ -133,7 +133,12 @@ export async function verifyAndUnpackRuntimeArchive(archive, output, manifest, {
   if (!isAbsolute(archive)) throw Error('Absolute release path required');
   const info = await lstat(archive);
   if (!info.isFile() || info.nlink !== 1 || info.size > MAX_RUNTIME_ARCHIVE_BYTES) throw Error('Invalid release archive size');
-  const scratch = await mkdtemp(join(tmpdir(), 't3-archive-verify-'));
+  // Releases can exceed the guest's temporary filesystem. Keep the independent
+  // verification copy beside the admitted download, on its owned update volume.
+  const parent = dirname(archive), parentInfo = await lstat(parent);
+  if (!parentInfo.isDirectory() || parentInfo.isSymbolicLink() || parentInfo.uid !== process.getuid() || parentInfo.mode & 0o022)
+    throw Error('Unsafe release archive directory');
+  const scratch = await mkdtemp(join(parent, 't3-archive-verify-'));
   try {
     const bundleSnapshot = await snapshotAttestation(bundleFile, scratch);
     const snapshot = join(scratch, 'runtime-blobs.tar');

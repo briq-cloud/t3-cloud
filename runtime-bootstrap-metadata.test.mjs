@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { mkdtemp, mkdir, open, readFile, readdir, writeFile, rm, chmod, lstat, readlink, symlink } from 'node:fs/promises';
+import { mkdtemp, mkdir, open, readFile, readdir, writeFile, rm, chmod, lstat, readlink, symlink, link } from 'node:fs/promises';
 import { join, dirname } from 'node:path';
 import { tmpdir } from 'node:os';
 import { prepareBootstrapMetadata, readBootstrapMigration, recoverBootstrapMigration } from './runtime-bootstrap-migration.mjs';
@@ -219,4 +219,34 @@ test('a lost journal after an owned protocol-2 launch never fabricates a new boo
   assert.deepEqual(await supervisor.initialize({ ownership: f.options.ownership, bootstrapMigration: receipt.id, initialMigrationReceipt: receipt }), { recoveryRequired: true });
   await assert.rejects(recoverBootstrapMigration({ ...f.options, supervisor, input: { ...await f.inputFor(), expectedJournalRevision: supervisor.journal.revision } }), /Contradictory/);
   await assert.rejects(lstat(supervisor.file), { code: 'ENOENT' }); assert.equal(f.starts.length, 1);
+});
+
+
+test('hardlinked image source is copied to an independent single-link verified release', async t => {
+  const f = await fixture(t); await f.initialize();
+  const source = join(f.imageRoot, 'opt/t3/node'), alias = join(dirname(f.state), 'image-node-alias');
+  await link(source, alias);
+  assert.equal((await lstat(source)).nlink, 2);
+  await recoverBootstrapMigration({ ...f.options, input: await f.inputFor() });
+  const root = f.options.supervisor.releaseRoot(f.signedIdentity), installed = join(root, 'opt/t3/node');
+  const target = await lstat(installed), original = await lstat(source);
+  assert.equal(target.nlink, 1); assert.notEqual(target.ino, original.ino);
+  await verifyInstalledBundle(root, f.signedIdentity, baseImage);
+  await writeFile(alias, Buffer.alloc(original.size, 120));
+  await verifyInstalledBundle(root, f.signedIdentity, baseImage);
+  // Independently created target files must still have no other hardlinks.
+  await link(installed, join(dirname(f.state), 'installed-node-alias'));
+  await assert.rejects(verifyInstalledBundle(root, f.signedIdentity, baseImage), /hardlinked/);
+  assert.equal(f.starts.length, 1);
+});
+
+test('corrupted hardlinked image source fails its signed hash before publication or quarantine', async t => {
+  const f = await fixture(t); await f.initialize();
+  const source = join(f.imageRoot, 'opt/t3/node'), alias = join(dirname(f.state), 'image-node-alias');
+  await link(source, alias);
+  await writeFile(alias, Buffer.alloc((await lstat(source)).size, 120));
+  assert.equal((await lstat(source)).nlink, 2);
+  await assert.rejects(recoverBootstrapMigration({ ...f.options, input: await f.inputFor() }), /Release blob mismatch/);
+  await assert.rejects(lstat(f.options.supervisor.releaseRoot(f.signedIdentity)), { code: 'ENOENT' });
+  await fenced(f);
 });

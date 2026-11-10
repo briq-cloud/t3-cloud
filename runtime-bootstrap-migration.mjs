@@ -146,7 +146,7 @@ export async function prepareBootstrapMetadata(env = process.env, { identity = l
 }
 
 export async function recoverBootstrapMigration({ state, env, source, baseImage, supervisor, ownership, input,
-  identity = linuxIdentity, acquireOwnership = acquireRuntimeOwnership, materialize = stageImageBundle, evidenceFs = { mkdir, open, rename } }) {
+  identity = linuxIdentity, acquireOwnership = acquireRuntimeOwnership, materialize = stageImageBundle, evidenceFs = { mkdir, open, rename }, onStage = () => {} }) {
   return supervisor.exclusive(async () => {
     let record = await readBootstrapMigration(state);
     if (!record || record.phase === 'completed' || input.action !== 'recover-bootstrap-migration' || input.expectedMigrationId !== record.id ||
@@ -164,11 +164,13 @@ export async function recoverBootstrapMigration({ state, env, source, baseImage,
     if (preparing) for (const item of record.legacyEvidence)
       if (await fingerprint(join(state, item.path)) !== item.fingerprint) throw Error('Legacy lock evidence changed');
     if (record.protocol === 2) {
+      onStage('materializing');
       const metadata = join(state, 'updates/bootstrap-metadata/manifest.json');
       const staged = await materialize(metadata, join(state, 'releases'), { expectedIdentity: record.runtimeIdentity,
         expectedSource: source, expectedImage: record.targetImage, expectedBase: baseImage });
       if (staged.identity !== record.runtimeIdentity) throw Error('Bootstrap materialization identity mismatch');
     }
+    onStage('verifying');
     const release = await supervisor.verifyRelease(record.runtimeIdentity);
     if (!release.files?.some(entry => entry.path === 'opt/t3-cloud/runtime-recovery.json' && entry.type === 'file' && entry.sha256 === createHash('sha256').update('{"protocol":1,"persistedBindings":"quarantine"}\n').digest('hex')) || release.source !== source || release.childImage !== record.targetImage) throw Error('Bootstrap artifact changed');
     if (revision(await readBootstrapMigration(state)) !== revision(record) || JSON.stringify(JSON.parse(await readFile(supervisor.file, 'utf8'))) !== JSON.stringify(j))
@@ -182,6 +184,7 @@ export async function recoverBootstrapMigration({ state, env, source, baseImage,
       record = { ...record, observedColdBootId: local.bootId, revision: record.revision + 1 };
       await durableJson(fileFor(state), record);
     }
+    onStage('quarantining');
     const evidence = join(state, 'updates/bootstrap-evidence', record.id);
     const syncEvidenceDirectory = async path => {
       const dir = await evidenceFs.open(path, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
@@ -201,6 +204,7 @@ export async function recoverBootstrapMigration({ state, env, source, baseImage,
       }
       if (await fingerprint(saved) !== item.fingerprint) throw Error('Quarantined evidence changed');
     }
+    onStage('claiming');
     await ownership.claimBootstrap({ id: record.id, preparationBootId: record.preparationBootId, expectedRevision: ownership.revision });
     const central = await acquireOwnership({ directory: state, name: 'central', environmentBinding: env.T3_CLOUD_OWNER_ID, deferClaim: true, legacy: join(state, 'central.lock') });
     try { await central.claimBootstrap({ id: record.id, preparationBootId: record.preparationBootId, expectedRevision: central.revision }); }
@@ -208,7 +212,9 @@ export async function recoverBootstrapMigration({ state, env, source, baseImage,
     await supervisor.save({ current: record.runtimeIdentity, staged: null, desired: null, receipt: null,
       initialInstall: record.id, phase: 'starting', recovery: 'persisted-bindings-quarantined' });
     try {
+      onStage('starting');
       await supervisor.driver.start(supervisor.releaseRoot(record.runtimeIdentity), release, { recovery: true });
+      onStage('health');
       await supervisor.driver.health();
       await supervisor.save({ phase: 'running' });
       await durableJson(fileFor(state), { ...record, phase: 'completed', observedColdBootId: local.bootId, revision: record.revision + 1 });

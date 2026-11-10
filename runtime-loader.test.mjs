@@ -26,7 +26,7 @@ async function unusedPort() {
   const server = createServer(); server.listen(0, '127.0.0.1'); await once(server, 'listening');
   const port = server.address().port; await new Promise(resolve => server.close(resolve)); return port;
 }
-async function fixture(t, { recovery = false, unknown = false, journal, ownershipEvidence, bootstrapMigration = false, releaseController = false, expectedCloseFailure = false, recoveryMaterialize } = {}) {
+async function fixture(t, { recovery = false, unknown = false, journal, ownershipEvidence, bootstrapMigration = false, releaseController = false, expectedCloseFailure = false, recoveryMaterialize, controllerInitialize } = {}) {
   const state = await mkdtemp(join(tmpdir(), 't3-loader-integration-'));
   let loader;
   t.after(async () => {
@@ -126,12 +126,12 @@ async function fixture(t, { recovery = false, unknown = false, journal, ownershi
       identity: async () => testIdentity, stage: async () => ({ identity, path: '/staged-fixture' }), verify: async () => ({ ...manifest, baseImage: `sha256:${'c'.repeat(64)}` }) });
     }
   }
-  let starts = 0, updateWork, controllerWork, controllerTerminal, recoveryWork; const recoveries = [], controllers = [];
+  let starts = 0, updateWork, controllerWork, controllerTerminal, reconcileWork; const recoveries = [], controllers = [];
   const port = await unusedPort();
   loader = await startLoader({ PORT: String(port), T3_HOST: '127.0.0.1', T3_CWD: state, T3_CLOUD_STATE: state,
     T3_CLOUD_PUBLIC_ORIGIN: origin, T3_CLOUD_OWNER_KEY: key, T3_CLOUD_OWNER_ID: 'owner', T3_CLOUD_CHILD_IMAGE: childImage }, {
     baseImageFile, sourceFile, acquireOwnership: bootstrapMigration ? migratedOwnership : ownershipEvidence ? options => acquireRuntimeOwnership({ ...options, lock: testLock, identity: async () => ({ ...testIdentity, ...(ownershipEvidence === 'cold' ? { bootId: '22222222-2222-2222-2222-222222222222' } : {}) }) }) : testOwnership,
-    recoverMigration: options => (recoveryWork = recoverBootstrapMigration({ ...options, identity: async () => ({ ...testIdentity, bootId: '22222222-2222-2222-2222-222222222222' }), acquireOwnership: migratedOwnership, ...(materialize ? { materialize: recoveryMaterialize ? (...args) => recoveryMaterialize(() => materialize(...args)) : materialize } : {}) })),
+    recoverMigration: options => recoverBootstrapMigration({ ...options, identity: async () => ({ ...testIdentity, bootId: '22222222-2222-2222-2222-222222222222' }), acquireOwnership: migratedOwnership, ...(materialize ? { materialize: recoveryMaterialize ? (...args) => recoveryMaterialize(() => materialize(...args)) : materialize } : {}) }),
     createDriver: env => runtimeProcess(env, { spawnProcess: (_command, _args, options) => {
       starts++; recoveries.push(options.env.T3_CLOUD_RECOVERY); return spawn(process.execPath, [childFile], options);
     } }),
@@ -150,9 +150,19 @@ async function fixture(t, { recovery = false, unknown = false, journal, ownershi
       const updates = new RuntimeUpdates({ ...options, schedule: () => ({ unref() {} }), cancel() {},
       consumer: { check: async () => ({ tag: `runtime-${source}`, source, publishedAt: '2026-11-09T00:00:00Z', sizes: {} }),
         stage: () => options.stage('/bounded/manifest', '/bounded/blobs') } });
+      if (controllerInitialize) {
+        const initialize = updates.initialize.bind(updates);
+        updates.initialize = async () => { await controllerInitialize(options); return initialize(); };
+      }
       const update = updates.update.bind(updates); updates.update = () => (updateWork = update()); return updates;
     },
-    createRecoveryManager: options => createCloudManager(options),
+    createRecoveryManager: options => {
+      const reconcile = options.runtimeUpdates.reconcile;
+      options.runtimeUpdates.reconcile = input => {
+        const work = reconcile(input); reconcileWork ??= work; return work;
+      };
+      return createCloudManager(options);
+    },
   });
   const send = async (path, { method = 'GET', input, auth = true, requestOrigin = origin, cookie, signal } = {}) => {
     const response = await fetch(`http://127.0.0.1:${port}${path}`, { method, signal,
@@ -162,7 +172,7 @@ async function fixture(t, { recovery = false, unknown = false, journal, ownershi
     const text = await response.text();
     return { status: response.status, headers: response.headers, text, value: (() => { try { return JSON.parse(text); } catch { return null; } })() };
   };
-  return { state, port, loader, send, recoveries, waitRecovery: async () => { await recoveryWork; }, controllers, selectedIdentity, controllerTerminal: () => controllerTerminal(), waitController: async () => { await new Promise(resolve => setImmediate(resolve)); await controllerWork; }, starts: () => starts, waitUpdate: async () => { await new Promise(resolve => setImmediate(resolve)); await updateWork; } };
+  return { state, port, loader, send, recoveries, waitReconcile: async () => { assert.ok(reconcileWork); await reconcileWork; }, controllers, selectedIdentity, controllerTerminal: () => controllerTerminal(), waitController: async () => { await new Promise(resolve => setImmediate(resolve)); await controllerWork; }, starts: () => starts, waitUpdate: async () => { await new Promise(resolve => setImmediate(resolve)); await updateWork; } };
 }
 
 test('authenticated owner update crosses real IPC; drain status stays available and committed receipt survives manager replacement', async t => {
@@ -352,12 +362,16 @@ test('protocol-2 metadata migration crosses real management parser, read-only co
 
 
 test('bootstrap materialization remains visibly busy after its HTTP caller disconnects and rejects concurrent recovery', async t => {
-  let entered, finish, calls = 0;
+  let entered, finish, controllerEntered, finishController, calls = 0;
   const started = new Promise(resolve => { entered = resolve; });
   const gate = new Promise(resolve => { finish = resolve; });
-  t.after(() => finish());
+  const controllerStarted = new Promise(resolve => { controllerEntered = resolve; });
+  const controllerGate = new Promise(resolve => { finishController = resolve; });
+  t.after(() => { finish(); finishController(); });
   const f = await fixture(t, { bootstrapMigration: 'metadata', recoveryMaterialize: async copy => {
     calls++; entered(); await gate; return copy();
+  }, controllerInitialize: async options => {
+    if (!options.recovery) { controllerEntered(); await controllerGate; }
   } });
   const before = (await f.send('/_cloud/updates/status')).value;
   const input = { action: 'recover-bootstrap-migration', expectedMigrationId: before.recovery.migration.id,
@@ -376,9 +390,14 @@ test('bootstrap materialization remains visibly busy after its HTTP caller disco
   assert.equal((await f.send('/_cloud/updates/status')).value.recovery.operation.outcome, 'in-progress');
   assert.equal(calls, 1); assert.equal(f.starts(), 0);
   assert.equal((await f.send('/native')).status, 503);
-  finish(); await f.waitRecovery();
-  // Join the existing loader completion, without issuing another mutation.
-  await new Promise(resolve => setImmediate(resolve));
+  // Join the operation owned by the recovery manager, including controller replacement.
+  let reconciled = false;
+  const completion = f.waitReconcile().then(() => { reconciled = true; });
+  finish(); await controllerStarted;
+  await Promise.resolve();
+  assert.equal(reconciled, false);
+  finishController(); await completion;
+  assert.equal(reconciled, true);
   const after = (await f.send('/_cloud/updates/status')).value;
   assert.equal(after.busy, false); assert.equal(after.phase, 'running');
   assert.equal(after.recovery.operation.outcome, 'completed');

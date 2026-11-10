@@ -413,6 +413,10 @@ test('bootstrap materialization remains visibly busy after its HTTP caller disco
   assert.equal(during.busy, true);
   assert.deepEqual(during.recovery.operation, { outcome: 'in-progress', stage: 'materializing', error: null, processLocal: true });
   assert.equal(during.phase, 'stopped'); assert.equal(during.recovery.available, false);
+  const healthDuringCopy = await f.send('/_cloud/health', { auth: false });
+  assert.equal(healthDuringCopy.status, 200);
+  assert.deepEqual(healthDuringCopy.value, { surface: 'management', status: 'ok' });
+  assert.equal((await f.send('/.well-known/t3/environment', { auth: false })).status, 503);
   assert.equal(JSON.parse(await readFile(join(f.state, 'updates/bootstrap-migration.json'), 'utf8')).phase, 'metadata-prepared');
   assert.equal((await f.send('/_cloud/updates/reconcile', { method: 'POST', input })).status, 503);
   assert.equal((await f.send('/_cloud/updates/status')).value.recovery.operation.outcome, 'in-progress');
